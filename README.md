@@ -189,7 +189,9 @@ error.
   list, in the order a single-threaded walk would meet them, and hands it to
   a `synchronized class Harvest` under the job number; after `join()` the
   lists are spliced in name order. The output is the same for `-j 1` and
-  `-j 16` (the end-to-end tests check it).
+  `-j 16` (the end-to-end tests check it). The workers are plain
+  `Thread`s: Loup 1.26's `ThreadPool.run` executes each task on the
+  calling thread, so a pool would not walk anything in parallel.
 - **A `synchronized class` with a rule that does not care who comes first.**
   `walk/ledger.lphc` keeps the seen-inode set and the walk's totals. Every
   entry that may be a repeat claims its `dev:ino` with a *walk key* (eight

@@ -68,6 +68,9 @@ and each is designed out:
    prints them to standard error in walk order, just before the entry's own
    line would have been reached.
 
+The workers are `Thread.spawnWith` threads, not a `ThreadPool`: in Loup
+1.26 `ThreadPool.run` runs each task inline on the calling thread.
+
 ## Shared state between threads
 
 | Object | Kind | Why |
