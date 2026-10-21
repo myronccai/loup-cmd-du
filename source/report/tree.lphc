@@ -1,0 +1,78 @@
+@mode(host.native)
+
+# du's directory tree for the report: the visits of one operand, linked
+# into Entry objects. Each entry owns its children and points back to its
+# parent, which is how an entry finds its own path.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler); tests/report_test.lphc builds trees
+# from hand-made visits in native test binaries (Stage0). `unowned` fields
+# are a host.native (and freestanding) feature.
+
+from walk.visit import (Visit, entry_path);
+
+# A node of the tree. The parent link is `unowned[~tree]`: it does not
+# keep the parent alive (no reference count, so parent and child do not
+# form a cycle that ARC could never free), and the compiler checks that
+# every parent stored in it outlives the child. That holds by
+# construction: a child is only ever made by its parent's add_child(),
+# and the parent keeps it in `children`.
+pub class Entry[lifetime ~tree] {
+    pub let visit: Visit;
+    pub unowned[~tree] var parent: Entry[~tree]?;
+    pub var children: list[Entry[~tree]] = [];
+
+    new(visit: Visit, parent: Entry[~tree]?) {
+        this.visit = visit;
+        this.parent = parent;
+    }
+
+    # Makes the entry for `visit` a child of this one and returns it.
+    pub modifier func add_child(visit: Visit): Entry[~tree] {
+        let child = Entry(visit, Some(this));
+        this.children.push(child);
+        return child;
+    }
+
+    # The path du prints: the operand as given for the root, and below it
+    # each parent's path, a slash and the name (entries store names only).
+    pub func path(): string {
+        match this.parent {
+            Some(p) => { return entry_path(p.path(), this.visit.name); },
+            None => { return this.visit.name; },
+        }
+    }
+
+    # Levels below the operand, counted up the parent links.
+    pub func level(): int {
+        var n = 0;
+        var up = this.parent;
+        while (up.is_some()) {
+            n += 1;
+            up = up.unwrap().parent;
+        }
+        return n;
+    }
+}
+
+# Adds the visits that follow position `at` and lie one level below
+# `parent` (with their own subtrees) as children of `parent`. Returns the
+# position of the first visit that is not below `parent`. The list is in
+# pre-order, so a parent's subtree is the run of deeper visits after it.
+func graft[lifetime ~t](edits parent: Entry[~t], visits: list[Visit], at: int): int {
+    let level = parent.visit.depth + 1;
+    var i = at;
+    while (i < visits.len() and visits[i].depth == level) {
+        var child = parent;
+        safe { child = parent.add_child(visits[i]); }
+        i = graft(edits: child, visits, i + 1);
+    }
+    return i;
+}
+
+# The tree of one operand's visits (visits[0] is the operand).
+pub func build_tree[lifetime ~t](visits: list[Visit]): Entry[~t] {
+    var root = Entry(visits[0], None);
+    graft(edits: root, visits, 1);
+    return root;
+}

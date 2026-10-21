@@ -1,0 +1,291 @@
+@mode(host.native)
+
+# du's --exclude and -X patterns: a shell-pattern matcher, GNU's rule for
+# which parts of a path a pattern is tried on, and ExcludeList, the pattern
+# set that every worker thread reads.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler); tests/excludes_test.lphc checks it
+# in native test binaries (Stage0).
+#
+# Structure: compiling a pattern into tokens (Glob), matching code points
+# with backtracking over the last `*`, excluded_path(), then ExcludeList.
+
+const TOKEN_LITERAL: int = 0;
+const TOKEN_ANY: int = 1;
+const TOKEN_STAR: int = 2;
+const TOKEN_CLASS: int = 3;
+
+# One element of a compiled pattern: a literal code point, `?`, `*`, or a
+# bracket expression given as ranges of code points.
+class GlobToken implements Sendable {
+    pub let kind: int;
+    pub let code: int;
+    pub let negated: bool;
+    pub let lows: list[int];
+    pub let highs: list[int];
+
+    new(kind: int, code: int, negated: bool, lows: list[int], highs: list[int]) {
+        this.kind = kind;
+        this.code = code;
+        this.negated = negated;
+        this.lows = lows;
+        this.highs = highs;
+    }
+
+    pub func accepts(c: int): bool {
+        if (this.kind == TOKEN_ANY) {
+            return true;
+        }
+        if (this.kind == TOKEN_LITERAL) {
+            return c == this.code;
+        }
+        var inside = false;
+        var k = 0;
+        while (!inside and k < this.lows.len()) {
+            inside = c >= this.lows[k] and c <= this.highs[k];
+            k += 1;
+        }
+        return inside != this.negated;
+    }
+}
+
+func codes_of(text: string): list[int] {
+    var codes: list[int] = [];
+    for (c in text.scalars()) {
+        codes.push(c.toInt());
+    }
+    return codes;
+}
+
+func simple_token(kind: int, code: int): GlobToken {
+    let none: list[int] = [];
+    return GlobToken(kind, code, false, none, none);
+}
+
+# A compiled shell pattern, as fnmatch(3) reads it without flags: `*`
+# matches any text (slashes and leading dots included), `?` one character,
+# `[...]` one character of a set (`[!...]` or `[^...]` negated, `a-z`
+# ranges, a leading `]` is literal), and `\` makes the next character
+# literal. An unterminated `[` is a literal `[`.
+pub class Glob implements Sendable {
+    pub let pattern: string;
+    let tokens: list[GlobToken];
+
+    new(pattern: string) {
+        this.pattern = pattern;
+        this.tokens = compile_tokens(codes_of(pattern));
+    }
+
+    # Whether the pattern matches all of `text`. Iterative matching with
+    # one backtrack point, the last `*` seen: on a mismatch the star takes
+    # one more character and the rest is tried again.
+    pub func matches(text: string): bool {
+        let s = codes_of(text);
+        var ti = 0;
+        var si = 0;
+        var star = -1;
+        var star_si = 0;
+        while (si < s.len()) {
+            if (ti < this.tokens.len() and this.tokens[ti].kind == TOKEN_STAR) {
+                star = ti;
+                star_si = si;
+                ti += 1;
+            } else if (ti < this.tokens.len() and this.tokens[ti].accepts(s[si])) {
+                ti += 1;
+                si += 1;
+            } else if (star >= 0) {
+                ti = star + 1;
+                star_si += 1;
+                si = star_si;
+            } else {
+                return false;
+            }
+        }
+        while (ti < this.tokens.len() and this.tokens[ti].kind == TOKEN_STAR) {
+            ti += 1;
+        }
+        return ti == this.tokens.len();
+    }
+}
+
+const BACKSLASH: int = 92;
+const STAR: int = 42;
+const QUESTION: int = 63;
+const OPEN_BRACKET: int = 91;
+const CLOSE_BRACKET: int = 93;
+const BANG: int = 33;
+const CARET: int = 94;
+const DASH: int = 45;
+
+# The tokens of a pattern, given as code points.
+func compile_tokens(p: list[int]): list[GlobToken] {
+    var tokens: list[GlobToken] = [];
+    var i = 0;
+    while (i < p.len()) {
+        let c = p[i];
+        if (c == STAR) {
+            tokens.push(simple_token(TOKEN_STAR, 0));
+            i += 1;
+        } else if (c == QUESTION) {
+            tokens.push(simple_token(TOKEN_ANY, 0));
+            i += 1;
+        } else if (c == BACKSLASH and i + 1 < p.len()) {
+            tokens.push(simple_token(TOKEN_LITERAL, p[i + 1]));
+            i += 2;
+        } else if (c == OPEN_BRACKET) {
+            let end = class_end(p, i);
+            if (end < 0) {
+                tokens.push(simple_token(TOKEN_LITERAL, c));
+                i += 1;
+            } else {
+                tokens.push(class_token(p, i, end));
+                i = end + 1;
+            }
+        } else {
+            tokens.push(simple_token(TOKEN_LITERAL, c));
+            i += 1;
+        }
+    }
+    return tokens;
+}
+
+# Index of the `]` that closes the bracket expression opening at `open`,
+# or -1. A `]` right after `[`, `[!` or `[^` belongs to the set.
+func class_end(p: list[int], open: int): int {
+    var j = open + 1;
+    if (j < p.len() and (p[j] == BANG or p[j] == CARET)) {
+        j += 1;
+    }
+    if (j < p.len() and p[j] == CLOSE_BRACKET) {
+        j += 1;
+    }
+    while (j < p.len()) {
+        if (p[j] == CLOSE_BRACKET) {
+            return j;
+        }
+        if (p[j] == BACKSLASH) {
+            j += 1;
+        }
+        j += 1;
+    }
+    return -1;
+}
+
+func class_token(p: list[int], open: int, close: int): GlobToken {
+    var j = open + 1;
+    var negated = false;
+    if (p[j] == BANG or p[j] == CARET) {
+        negated = true;
+        j += 1;
+    }
+    var lows: list[int] = [];
+    var highs: list[int] = [];
+    while (j < close) {
+        var lo = p[j];
+        if (lo == BACKSLASH and j + 1 < close) {
+            j += 1;
+            lo = p[j];
+        }
+        j += 1;
+        var hi = lo;
+        # `a-z` is a range unless the `-` is the last character of the set.
+        if (j + 1 < close and p[j] == DASH) {
+            hi = p[j + 1];
+            j += 2;
+        }
+        # A reversed range (`z-a`) matches nothing, as in fnmatch.
+        if (lo <= hi) {
+            lows.push(lo);
+            highs.push(hi);
+        }
+    }
+    return GlobToken(TOKEN_CLASS, 0, negated, lows, highs);
+}
+
+# GNU du's rule (an unanchored exclude pattern): a pattern excludes a path
+# when it matches the whole path, or the part after any `/` that is not
+# followed by another `/`. So `*.o` excludes `src/a.o`, and `b/c`
+# excludes `a/b/c`.
+pub func excluded_path(glob: Glob, path: string): bool {
+    if (glob.matches(path)) {
+        return true;
+    }
+    let parts = path.split("/");
+    var k = 1;
+    while (k < parts.len()) {
+        if (parts[k] != "") {
+            let tail: list[string] = parts.slice(k);
+            if (glob.matches(tail.join("/"))) {
+                return true;
+            }
+        }
+        k += 1;
+    }
+    return false;
+}
+
+# The lock's operations live in functions that receive the lock and finish
+# with it before they return: the Stage0 native back end does not lower
+# RwLock methods called on a field, and the self-hosted one does not lower
+# guard methods on a guard that another function returned.
+
+# Appends `glob` under the write lock and publishes the new count.
+func publish(lock: RwLock[int], edits globs: list[Glob], glob: Glob): void {
+    let guard = lock.writeLock();
+    globs.push(glob);
+    guard.set(globs.len());
+    guard.release();
+}
+
+func published_count(lock: RwLock[int]): int {
+    let guard = lock.readLock();
+    let n = guard.get();
+    guard.release();
+    return n;
+}
+
+# Whether one of the published patterns excludes `path`, all under one
+# read lock.
+func any_excludes(lock: RwLock[int], globs: list[Glob], path: string): bool {
+    let guard = lock.readLock();
+    let n = guard.get();
+    var hit = false;
+    var k = 0;
+    while (!hit and k < n) {
+        hit = excluded_path(globs[k], path);
+        k += 1;
+    }
+    guard.release();
+    return hit;
+}
+
+# The exclude patterns, shared by every worker thread of the walk.
+#
+# Readers and the writer follow the reader-writer protocol: a worker
+# matches while holding the read lock, so any number of workers match at
+# once; add() appends under the write lock, which waits until no reader
+# is inside. The lock's value is the number of published patterns, so a
+# reader never looks past what was complete when it took the lock. (In
+# this program du adds every pattern before the first worker starts; the
+# lock is what would keep a later add() correct.)
+#
+# The class is Sendable without an opt-out: its only fields are `let`
+# bindings and the lock.
+pub class ExcludeList implements Sendable {
+    let globs: list[Glob] = [];
+    let published: RwLock[int] = RwLock.new(0);
+
+    pub modifier func add(pattern: string): void {
+        publish(this.published, edits: this.globs, Glob(pattern));
+    }
+
+    pub func len(): int {
+        return published_count(this.published);
+    }
+
+    # Whether any pattern excludes `path`.
+    pub func excludes(path: string): bool {
+        return any_excludes(this.published, this.globs, path);
+    }
+}

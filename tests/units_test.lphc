@@ -1,0 +1,103 @@
+@mode(host.native)
+
+# Unit tests for du's units (size/units.lphc): SIZE arguments, the
+# environment's block size, and the printed sizes.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here,
+# with the modules it imports from source/ and tests/ (both on LOUPPATH),
+# into its own native binary and runs it. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text);
+from size.units import (parse_size, parse_block_size, block_size_from_env, format_size,
+    human_size, fixed_unit, human_unit, ceil_div);
+
+func size_error(text: string, option: string, signed: bool): string {
+    match parse_size(text, option, signed) {
+        Ok(_) => { return "ok"; },
+        Err(msg) => { return msg; },
+    }
+}
+
+func test_plain_numbers_and_units(): void {
+    expectEq(parse_size("512", "-B", false).unwrap().bytes, 512, "512");
+    expectEq(parse_size("2K", "-B", false).unwrap().bytes, 2048, "2K");
+    expectEq(parse_size("1M", "-B", false).unwrap().bytes, 1048576, "1M");
+    expectEq(parse_size("1kB", "-B", false).unwrap().bytes, 1000, "1kB");
+    expectEq(parse_size("3MB", "-B", false).unwrap().bytes, 3000000, "3MB");
+    expectEq(parse_size("1KiB", "-B", false).unwrap().bytes, 1024, "1KiB");
+    expectEq(parse_size("1k", "-B", false).unwrap().bytes, 1024, "lower-case k");
+    expectEq(parse_size("1G", "-B", false).unwrap().bytes, 1073741824, "1G");
+    expect_text(parse_size("2K", "-B", false).unwrap().suffix, "", "a number: no suffix");
+}
+
+func test_unit_alone_prints_a_suffix(): void {
+    let k = parse_size("K", "-B", false).unwrap();
+    expectEq(k.bytes, 1024, "K");
+    expect_text(k.suffix, "K", "K suffix");
+    expect_text(parse_size("KB", "-B", false).unwrap().suffix, "kB", "KB is printed kB");
+    expect_text(parse_size("kiB", "-B", false).unwrap().suffix, "KiB", "kiB is printed KiB");
+    expect_text(parse_size("MB", "-B", false).unwrap().suffix, "MB", "MB");
+}
+
+func test_size_errors(): void {
+    expect_text(size_error("b", "-B", false), "invalid -B argument 'b'", "no number, bad unit");
+    expect_text(size_error("1b", "-B", false), "invalid suffix in -B argument '1b'", "bad unit");
+    expect_text(size_error("Ki", "-B", false), "invalid suffix in -B argument 'Ki'", "half a unit");
+    expect_text(size_error("1.5K", "-B", false), "invalid suffix in -B argument '1.5K'", "fraction");
+    expect_text(size_error("", "-B", false), "invalid -B argument ''", "empty");
+    expect_text(size_error("99999999999999999999", "-B", false),
+        "-B argument '99999999999999999999' too large", "too many digits");
+    expect_text(size_error("1Y", "--block-size", false), "--block-size argument '1Y' too large", "yotta");
+    expect_text(size_error("-5", "-B", false), "invalid -B argument '-5'", "no sign for -B");
+}
+
+func test_signed_threshold(): void {
+    expectEq(parse_size("-9K", "-t", true).unwrap().bytes, 0 - 9216, "-9K");
+    expectEq(parse_size("0", "-t", true).unwrap().bytes, 0, "0");
+    expect_text(size_error("0x", "-t", true), "invalid suffix in -t argument '0x'", "bad suffix");
+}
+
+func test_block_size_words(): void {
+    expectEq(parse_block_size("human-readable", "-B").unwrap().human, 1024, "human-readable");
+    expectEq(parse_block_size("human", "-B").unwrap().human, 1024, "a prefix of it");
+    expectEq(parse_block_size("si", "-B").unwrap().human, 1000, "si");
+    expect(parse_block_size("0", "-B").is_err(), "zero");
+    expect(parse_block_size("0K", "-B").is_err(), "zero kilobytes");
+}
+
+func test_environment_order(): void {
+    expectEq(block_size_from_env("M", "1000", "K", false).factor, 1048576, "DU_BLOCK_SIZE first");
+    expectEq(block_size_from_env("", "1000", "K", false).factor, 1000, "then BLOCK_SIZE");
+    expectEq(block_size_from_env("", "", "K", false).factor, 1024, "then BLOCKSIZE");
+    expect_text(block_size_from_env("", "", "K", false).suffix, "K", "with its suffix");
+    expectEq(block_size_from_env("junk", "", "", false).factor, 1024, "invalid: default");
+    expectEq(block_size_from_env("", "", "", true).factor, 512, "POSIXLY_CORRECT");
+}
+
+func test_whole_units_round_up(): void {
+    expectEq(ceil_div(0, 1024), 0, "zero");
+    expectEq(ceil_div(1, 1024), 1, "one byte");
+    expectEq(ceil_div(1024, 1024), 1, "exact");
+    expectEq(ceil_div(1025, 1024), 2, "one over");
+    expect_text(format_size(12288, fixed_unit(1024)), "12", "12K");
+    expect_text(format_size(12288, parse_block_size("K", "-B").unwrap()), "12K", "with suffix");
+    expect_text(format_size(12288, parse_block_size("KB", "-B").unwrap()), "13kB", "1000-based");
+}
+
+func test_human_readable(): void {
+    expect_text(human_size(0, 1024), "0", "zero");
+    expect_text(human_size(1023, 1024), "1023", "below a kilobyte");
+    expect_text(human_size(1024, 1024), "1.0K", "1K");
+    expect_text(human_size(9000, 1024), "8.8K", "rounded up to a tenth");
+    expect_text(human_size(10230, 1024), "10K", "9.99K rounds up to 10");
+    expect_text(human_size(14107, 1024), "14K", "no decimal from 10 on");
+    expect_text(human_size(1023999, 1024), "1000K", "1000K");
+    expect_text(human_size(1048575, 1024), "1.0M", "next unit");
+    expect_text(human_size(5000000000, 1024), "4.7G", "gigabytes");
+    expect_text(human_size(1023, 1000), "1.1k", "si kilo");
+    expect_text(human_size(102400, 1000), "103k", "si");
+    expect_text(human_size(5000000000, 1000), "5.0G", "si giga");
+    expect_text(format_size(4096, human_unit(1024)), "4.0K", "format -h");
+}

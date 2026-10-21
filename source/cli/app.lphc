@@ -1,0 +1,72 @@
+@mode(host.native)
+
+# Top level of du: parse the arguments, answer --help and --version, settle
+# the unit (options, else the environment), and run the walk.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler). tests/app_test.lphc calls
+# run_with_env() inside native test binaries (Stage0).
+
+from appinfo import (APP_NAME, EXIT_OK, EXIT_FAILURE);
+from cli.args import (Options, ArgError, parse_args);
+from cli.usage import (usage, version_line);
+from commands.du import (run_du);
+from size.units import (block_size_from_env);
+
+# The environment du reads, gathered in one place so that tests can pass
+# their own.
+pub class Environment {
+    pub let du_block_size: string;
+    pub let block_size: string;
+    pub let blocksize: string;
+    pub let posixly_correct: bool;
+
+    new(du_block_size: string, block_size: string, blocksize: string, posixly_correct: bool) {
+        this.du_block_size = du_block_size;
+        this.block_size = block_size;
+        this.blocksize = blocksize;
+        this.posixly_correct = posixly_correct;
+    }
+}
+
+# Parses argv, runs du and returns the exit status.
+pub func run(argv: list[string]): int {
+    let environment = Environment(env("DU_BLOCK_SIZE") ?? "", env("BLOCK_SIZE") ?? "",
+        env("BLOCKSIZE") ?? "", env("POSIXLY_CORRECT").is_some());
+    return run_with_env(argv, environment);
+}
+
+pub func run_with_env(argv: list[string], environment: Environment): int {
+    match parse_args(argv) {
+        Err(problem) => { return report_usage_error(problem); },
+        Ok(opts) => {
+            var parsed = opts;
+            return run_parsed(edits: parsed, environment);
+        },
+    }
+}
+
+func run_parsed(edits opts: Options, environment: Environment): int {
+    if (opts.help) {
+        println(usage());
+        return EXIT_OK;
+    }
+    if (opts.version) {
+        println(version_line());
+        return EXIT_OK;
+    }
+    if (!opts.block_given) {
+        let unit = block_size_from_env(environment.du_block_size, environment.block_size,
+            environment.blocksize, environment.posixly_correct);
+        safe { opts.block = unit; }
+    }
+    return run_du(opts);
+}
+
+func report_usage_error(problem: ArgError): int {
+    printErr(i"{$ APP_NAME $}: {$ problem.message $}");
+    if (problem.hint) {
+        printErr(i"Try '{$ APP_NAME $} --help' for more information.");
+    }
+    return EXIT_FAILURE;
+}

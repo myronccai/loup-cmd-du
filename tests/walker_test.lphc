@@ -1,0 +1,119 @@
+@mode(host.native)
+
+# Unit tests for du's parallel walk (walk/walker.lphc) on scratch trees:
+# pre-order and depths, sizes, excludes, hard links, -L cycles, and the
+# same visits for any number of worker threads.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here
+# into its own native binary and runs it in a fresh temporary directory,
+# where these tests build their trees. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text, make_dir, make_file, make_hard_link, make_symlink);
+from cli.args import (Options, parse_args);
+from walk.excludes import (ExcludeList);
+from walk.ledger import (Ledger);
+from walk.visit import (Visit);
+from walk.walker import (walk_operand);
+
+# root/
+#   b/       c (300 bytes), d/ e (40 bytes)
+#   a        (1000 bytes)
+#   z/       y (7 bytes)
+func make_tree(root: string): void {
+    make_dir(root + "/b/d");
+    make_dir(root + "/z");
+    make_file(root + "/a", 1000);
+    make_file(root + "/b/c", 300);
+    make_file(root + "/b/d/e", 40);
+    make_file(root + "/z/y", 7);
+}
+
+func walk(argv: list[string], operand: string, threads: int): list[Visit] {
+    let opts = parse_args(argv).unwrap();
+    let excludes = ExcludeList();
+    for (pattern in opts.excludes) {
+        safe { excludes.add(pattern); }
+    }
+    return walk_operand(operand, 0, threads, opts, excludes, Ledger(), false);
+}
+
+# "depth name bytes" per visit, apparent sizes, directories as 0.
+func describe(visits: list[Visit]): string {
+    var parts: list[string] = [];
+    for (v in visits) {
+        parts.push(i"{$ v.depth $} {$ v.name $} {$ v.bytes $}");
+    }
+    return parts.join(", ");
+}
+
+func test_pre_order_with_depths(): void {
+    make_tree("t1");
+    expect_text(describe(walk(["--apparent-size"], "t1", 2)),
+        "0 t1 0, 1 a 1000, 1 b 0, 2 c 300, 2 d 0, 3 e 40, 1 z 0, 2 y 7",
+        "name order, each directory before its entries");
+}
+
+func test_same_visits_for_any_thread_count(): void {
+    make_tree("t2");
+    let one = describe(walk(["--apparent-size"], "t2", 1));
+    expect_text(describe(walk(["--apparent-size"], "t2", 8)), one, "8 workers");
+    expect_text(describe(walk(["--apparent-size"], "t2", 2)), one, "2 workers");
+}
+
+func test_excludes_drop_subtrees(): void {
+    make_tree("t3");
+    expect_text(describe(walk(["--apparent-size", "--exclude=b"], "t3", 2)),
+        "0 t3 0, 1 a 1000, 1 z 0, 2 y 7", "b and everything below it");
+    expect_text(describe(walk(["--apparent-size", "--exclude=*e"], "t3", 2)),
+        "0 t3 0, 1 a 1000, 1 b 0, 2 c 300, 2 d 0, 1 z 0, 2 y 7", "a pattern on the whole path");
+}
+
+func test_disk_usage_in_blocks(): void {
+    make_dir("t4");
+    make_file("t4/f", 5000);
+    let visits = walk(["-a"], "t4", 1);
+    expectEq(visits.len(), 2, "two entries");
+    expect(visits[1].bytes >= 4096 and visits[1].bytes % 512 == 0, "allocated blocks of 512 bytes");
+}
+
+func test_hard_links_take_part(): void {
+    make_dir("t5/p");
+    make_dir("t5/q");
+    make_file("t5/p/f", 50);
+    make_hard_link("t5/p/f", "t5/q/g");
+    make_file("t5/q/h", 5);
+    let visits = walk(["--apparent-size"], "t5", 2);
+    expect(visits[2].inode != "", "a linked file is in the seen-inode set");
+    expect_text(visits[2].inode, visits[4].inode, "both links are one inode");
+    expect(visits[2].key < visits[4].key, "the first link has the smaller key");
+    expect_text(visits[5].inode, "", "a single-link file is not");
+}
+
+func test_symlinks_and_cycles(): void {
+    make_dir("t6/d");
+    make_file("t6/d/f", 9);
+    make_symlink("..", "t6/d/up");
+    expect_text(describe(walk(["--apparent-size"], "t6", 2)),
+        "0 t6 0, 1 d 0, 2 f 9, 2 up 2", "-P: the link itself (its target text is 2 bytes)");
+    expect_text(describe(walk(["--apparent-size", "-L"], "t6", 2)),
+        "0 t6 0, 1 d 0, 2 f 9", "-L: a link to an ancestor is skipped");
+}
+
+func test_operand_errors(): void {
+    let visits = walk(none_args(), "missing", 2);
+    expectEq(visits.len(), 1, "one visit");
+    expect(!visits[0].present, "nothing to count");
+    expect_text(visits[0].error, "cannot access 'missing': No such file or directory", "message");
+}
+
+func test_file_operand(): void {
+    make_file("single", 123);
+    expect_text(describe(walk(["--apparent-size"], "single", 4)), "0 single 123", "a file operand");
+}
+
+func none_args(): list[string] {
+    let none: list[string] = [];
+    return none;
+}

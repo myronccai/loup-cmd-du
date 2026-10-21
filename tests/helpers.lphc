@@ -1,0 +1,40 @@
+@mode(host.native)
+
+# Shared helpers for the du tests: string comparison that works in native
+# test binaries, and builders for scratch trees (files of exact sizes, hard
+# and symbolic links). Not a test file itself: the tests import it.
+#
+# Runtime: host.native, test support. Never built on its own: `make test`
+# puts tests/ on LOUPPATH, so `loup-bootstrap test --native` compiles it
+# into each test binary that imports it. Not part of build/du. The trees
+# are made in the test binary's working directory, a fresh temporary
+# directory for each test file.
+
+from debug.assert import (expect);
+from io.fs import (createDir, writeText);
+
+extern native "c" func link(existing: string, created: string): int32;
+extern native "c" func symlink(target: string, created: string): int32;
+
+# expectEq on two strings fails in native tests even when they are equal
+# (Loup 1.26.0), so string results are compared with ==.
+pub func expect_text(actual: string, expected: string, context: string): void {
+    expect(actual == expected, i"{$ context $}: expected '{$ expected $}', got '{$ actual $}'");
+}
+
+pub func make_dir(path: string): void {
+    createDir(path);
+}
+
+# A file of exactly `size` bytes.
+pub func make_file(path: string, size: int): void {
+    writeText(path, "x".repeat(size));
+}
+
+pub func make_hard_link(existing: string, created: string): void {
+    expect(link(existing, created) == 0i32, "link " + created);
+}
+
+pub func make_symlink(target: string, created: string): void {
+    expect(symlink(target, created) == 0i32, "symlink " + created);
+}

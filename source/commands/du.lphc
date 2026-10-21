@@ -1,0 +1,126 @@
+@mode(host.native)
+
+# The du command: load the exclude patterns, walk each operand (in
+# parallel inside it, one operand after the other), report it, and turn
+# the error count into the exit status.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler). The only module that prints;
+# tests/app_test.lphc runs it end to end in native test binaries (Stage0).
+
+from appinfo import (APP_NAME, EXIT_OK, EXIT_FAILURE, DEFAULT_MAX_THREADS);
+from cli.args import (Options, DEREF_ALL);
+from io.fs import (exists, isDir);
+from report.report import (Report, OutLine);
+from report.tree import (build_tree);
+from walk.excludes import (ExcludeList);
+from walk.ledger import (Ledger);
+from walk.walker import (walk_operand);
+
+# The worker count: -j, else one per CPU up to DEFAULT_MAX_THREADS.
+pub func thread_count(opts: Options): int {
+    if (opts.threads > 0) {
+        return opts.threads;
+    }
+    let cpus = Thread.hardwareConcurrency();
+    if (cpus < 1) {
+        return 1;
+    }
+    return if (cpus > DEFAULT_MAX_THREADS) { DEFAULT_MAX_THREADS } else { cpus };
+}
+
+# The patterns of a -X file, one per line ("-" is standard input), or Err
+# with the message GNU du dies with.
+pub func read_pattern_file(path: string): Result[list[string], string] {
+    var text = "";
+    if (path == "-") {
+        text = readText("/dev/stdin");
+    } else if (isDir(path)) {
+        return Err(i"{$ path $}: Is a directory");
+    } else if (!exists(path)) {
+        return Err(i"{$ path $}: No such file or directory");
+    } else {
+        text = readText(path);
+    }
+    var patterns: list[string] = [];
+    for (line in text.split("\n")) {
+        if (line != "") {
+            patterns.push(line);
+        }
+    }
+    return Ok(patterns);
+}
+
+# The exclude list of the run, or Err when a -X file cannot be read.
+pub func load_excludes(opts: Options): Result[ExcludeList, string] {
+    let list = ExcludeList();
+    for (pattern in opts.excludes) {
+        safe { list.add(pattern); }
+    }
+    for (file in opts.exclude_files) {
+        match read_pattern_file(file) {
+            Ok(patterns) => {
+                for (pattern in patterns) {
+                    safe { list.add(pattern); }
+                }
+            },
+            Err(msg) => { return Err(msg); },
+        }
+    }
+    return Ok(list);
+}
+
+func flush(lines: list[OutLine]): void {
+    for (line in lines) {
+        if (line.to_stderr) {
+            printErr(line.text);
+        } else {
+            print(line.text);
+        }
+    }
+}
+
+pub func run_du(opts: Options): int {
+    var excludes = ExcludeList();
+    match load_excludes(opts) {
+        Ok(list) => { excludes = list; },
+        Err(msg) => {
+            # GNU reads -X files while parsing, so the usage hint follows.
+            printErr(i"{$ APP_NAME $}: {$ msg $}");
+            printErr(i"Try '{$ APP_NAME $} --help' for more information.");
+            return EXIT_FAILURE;
+        },
+    }
+    var operands: list[string] = [];
+    for (operand in opts.operands) {
+        operands.push(operand);
+    }
+    if (operands.len() == 0) {
+        operands.push(".");
+    }
+    # GNU du's rule: with several operands, or with -L, every file and
+    # directory counts once over the whole run.
+    let hash_all = operands.len() > 1 or opts.deref == DEREF_ALL;
+    let threads = thread_count(opts);
+    let ledger = Ledger();
+    let report = Report(opts, ledger);
+    var number = 0;
+    while (number < operands.len()) {
+        let visits = walk_operand(operands[number], number, threads, opts, excludes, ledger, hash_all);
+        if (visits.len() > 0) {
+            let tree = build_tree(visits);
+            safe { report.emit(tree, 0); }
+        }
+        # Print each operand's lines as soon as it is done.
+        flush(report.lines);
+        safe { report.clear(); }
+        number += 1;
+    }
+    if (opts.grand_total) {
+        safe { report.add_total(); }
+        flush(report.lines);
+    }
+    var errors = 0;
+    safe { errors = ledger.error_count(); }
+    return if (errors > 0) { EXIT_FAILURE } else { EXIT_OK };
+}

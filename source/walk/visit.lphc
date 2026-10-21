@@ -1,0 +1,63 @@
+@mode(host.native)
+
+# du's record of one walked entry, as a worker thread writes it down: what
+# the report needs later, and nothing that points into the walk.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler) and into the unit-test binaries
+# (Stage0) that build visits by hand.
+
+# One entry in walk order. `depth` is 0 for the operand, 1 for the entries
+# of the operand directory, and so on; a list of visits in pre-order with
+# their depths is the whole tree. An entry that could not be stat'ed is
+# `present = false` and only carries its error message.
+pub class Visit implements Sendable {
+    # The operand as given (depth 0), else the entry's name.
+    pub let name: string;
+    pub let depth: int;
+    pub let is_dir: bool;
+    pub let present: bool;
+    # The entry's own size in bytes: st_blocks * 512, or st_size with
+    # --apparent-size.
+    pub let bytes: int;
+    # dev:ino when the entry is in the seen-inode set, else "".
+    pub let inode: string;
+    # The walk key the inode was claimed with (see walk/ledger.lphc).
+    pub let key: string;
+    # A message for standard error ("cannot read directory ..."), or "".
+    pub let error: string;
+
+    new(name: string, depth: int, is_dir: bool, present: bool, bytes: int, inode: string, key: string, error: string) {
+        this.name = name;
+        this.depth = depth;
+        this.is_dir = is_dir;
+        this.present = present;
+        this.bytes = bytes;
+        this.inode = inode;
+        this.key = key;
+        this.error = error;
+    }
+}
+
+pub func file_visit(name: string, depth: int, bytes: int): Visit {
+    return Visit(name, depth, false, true, bytes, "", "", "");
+}
+
+pub func dir_visit(name: string, depth: int, bytes: int): Visit {
+    return Visit(name, depth, true, true, bytes, "", "", "");
+}
+
+pub func error_visit(name: string, depth: int, error: string): Visit {
+    return Visit(name, depth, false, false, 0, "", "", error);
+}
+
+# The path of an entry named `name` in the directory `dir`, as GNU du
+# writes it: the directory without its trailing slashes, then `/name`
+# (so the entries of `t/` are `t/a`, and those of `/` are `/a`).
+pub func entry_path(dir: string, name: string): string {
+    var end = dir.len();
+    while (end > 0 and dir.slice(end - 1, end) == "/") {
+        end -= 1;
+    }
+    return dir.slice(0, end) + "/" + name;
+}

@@ -1,0 +1,364 @@
+@mode(host.native)
+
+# Command-line parsing for du, getopt_long style: bundled short options
+# (`-sh`, `-d1`, `-BM`), long options with `=VALUE` or a separate value and
+# any unambiguous prefix (`--max=1`), options after operands, `--` to end
+# them. Loup 1.26 has no CLI library, so this is done by hand.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler). Pure functions;
+# tests/args_test.lphc checks them in native test binaries (Stage0).
+#
+# Structure: Options and its constants, the option table, parse_args()
+# (sorting argv into options and operands), apply() (what each option
+# does), then the checks GNU du makes once everything is read.
+
+from size.units import (BlockSize, fixed_unit, human_unit, parse_block_size, parse_size);
+
+# Which symbolic links the walk follows: -P (none, the default), -H/-D
+# (those named on the command line), -L (all).
+pub const DEREF_NONE: int = 0;
+pub const DEREF_ARGS: int = 1;
+pub const DEREF_ALL: int = 2;
+
+# Everything the command line says. Records that cross modules are classes
+# (the native back ends lay out struct fields by name program-wide).
+#
+# The worker threads read the options while they walk, so the class must
+# be Sendable, and a Sendable class may only have `var` fields that are
+# locks. These fields are plain: the parser fills them on the main thread
+# before the first worker starts, and nothing writes them afterwards. That
+# is a protocol the compiler cannot check, so the class states it.
+@unsafe("sendable: parse_args() fills the fields before any worker thread starts; afterwards they are only read")
+pub class Options implements Sendable {
+    pub var all: bool = false;
+    pub var apparent: bool = false;
+    pub var block: BlockSize = fixed_unit(1024);
+    # Whether -B, -k, -m, -b, -h or --si chose the unit (else the
+    # environment does).
+    pub var block_given: bool = false;
+    pub var grand_total: bool = false;
+    # -1: no limit.
+    pub var max_depth: int = -1;
+    pub var depth_given: bool = false;
+    pub var summarize: bool = false;
+    pub var deref: int = DEREF_NONE;
+    pub var count_links: bool = false;
+    pub var separate_dirs: bool = false;
+    pub var one_file_system: bool = false;
+    pub var zero_terminated: bool = false;
+    # -t SIZE in bytes: print entries of at least SIZE, or of at most -SIZE
+    # when negative.
+    pub var threshold: int = 0;
+    pub var threshold_given: bool = false;
+    # Worker threads; 0 means "choose" (the CPU count, capped).
+    pub var threads: int = 0;
+    pub var excludes: list[string] = [];
+    pub var exclude_files: list[string] = [];
+    pub var operands: list[string] = [];
+    pub var help: bool = false;
+    pub var version: bool = false;
+}
+
+# A usage error: GNU du's message, and whether "Try 'du --help'" follows
+# it (GNU leaves the hint out after a bad SIZE).
+pub class ArgError {
+    pub let message: string;
+    pub let hint: bool;
+
+    new(message: string, hint: bool) {
+        this.message = message;
+        this.hint = hint;
+    }
+}
+
+func usage_error(message: string): ArgError {
+    return ArgError(message, true);
+}
+
+# A long option: its name, the id apply() knows it by (the equivalent short
+# letter, or the name itself), and whether it takes a value.
+class LongOption {
+    pub let name: string;
+    pub let id: string;
+    pub let needs_value: bool;
+
+    new(name: string, id: string, needs_value: bool) {
+        this.name = name;
+        this.id = id;
+        this.needs_value = needs_value;
+    }
+}
+
+# In GNU du's order, which is the order ambiguous prefixes are listed in.
+func long_options(): list[LongOption] {
+    return [
+        LongOption("all", "a", false),
+        LongOption("apparent-size", "apparent-size", false),
+        LongOption("block-size", "B", true),
+        LongOption("bytes", "b", false),
+        LongOption("count-links", "l", false),
+        LongOption("dereference", "L", false),
+        LongOption("dereference-args", "D", false),
+        LongOption("exclude", "exclude", true),
+        LongOption("exclude-from", "X", true),
+        LongOption("human-readable", "h", false),
+        LongOption("si", "si", false),
+        LongOption("max-depth", "d", true),
+        LongOption("null", "0", false),
+        LongOption("no-dereference", "P", false),
+        LongOption("one-file-system", "x", false),
+        LongOption("separate-dirs", "S", false),
+        LongOption("summarize", "s", false),
+        LongOption("threads", "j", true),
+        LongOption("threshold", "t", true),
+        LongOption("total", "c", false),
+        LongOption("help", "help", false),
+        LongOption("version", "version", false),
+    ];
+}
+
+const SHORT_FLAGS: string = "0abcDhHklLmPsSx";
+const SHORT_WITH_VALUE: string = "BdjtX";
+
+# The long option `name` stands for: an exact name, or the only one it is a
+# prefix of. Err with GNU's message otherwise.
+func find_long(name: string, shown: string): Result[LongOption, string] {
+    let table = long_options();
+    var matches: list[LongOption] = [];
+    for (opt in table) {
+        if (opt.name == name) {
+            return Ok(opt);
+        }
+        if (opt.name.startsWith(name)) {
+            matches.push(opt);
+        }
+    }
+    if (matches.len() == 1) {
+        return Ok(matches[0]);
+    }
+    if (matches.len() == 0) {
+        return Err(i"unrecognized option '{$ shown $}'");
+    }
+    var names: list[string] = [];
+    for (opt in matches) {
+        names.push("'--" + opt.name + "'");
+    }
+    let listed = names.join(" ");
+    return Err(i"option '--{$ name $}' is ambiguous; possibilities: {$ listed $}");
+}
+
+# A non-negative decimal number, or -1.
+func parse_count(text: string): int {
+    if (text.len() == 0 or text.len() > 18) {
+        return -1;
+    }
+    var n = 0;
+    for (ch in text) {
+        let d = "0123456789".index_of(ch);
+        if (d < 0) {
+            return -1;
+        }
+        n = n * 10 + d;
+    }
+    return n;
+}
+
+# Applies option `id` (with its value, "" for a flag) to `opts`. `shown` is
+# the option as written, for messages. Returns "" or an error message.
+func apply(edits opts: Options, id: string, value: string, shown: string): string {
+    if (id == "a") {
+        safe { opts.all = true; }
+    } else if (id == "apparent-size") {
+        safe { opts.apparent = true; }
+    } else if (id == "b") {
+        safe {
+            opts.apparent = true;
+            opts.block = fixed_unit(1);
+            opts.block_given = true;
+        }
+    } else if (id == "B") {
+        match parse_block_size(value, shown) {
+            Ok(bs) => {
+                safe {
+                    opts.block = bs;
+                    opts.block_given = true;
+                }
+            },
+            Err(msg) => { return msg; },
+        }
+    } else if (id == "k" or id == "m") {
+        let factor = if (id == "k") { 1024 } else { 1048576 };
+        safe {
+            opts.block = fixed_unit(factor);
+            opts.block_given = true;
+        }
+    } else if (id == "h" or id == "si") {
+        let base = if (id == "h") { 1024 } else { 1000 };
+        safe {
+            opts.block = human_unit(base);
+            opts.block_given = true;
+        }
+    } else if (id == "c") {
+        safe { opts.grand_total = true; }
+    } else if (id == "d") {
+        let depth = parse_count(value);
+        if (depth < 0) {
+            return i"invalid maximum depth '{$ value $}'";
+        }
+        safe {
+            opts.max_depth = depth;
+            opts.depth_given = true;
+        }
+    } else if (id == "s") {
+        safe { opts.summarize = true; }
+    } else if (id == "L") {
+        safe { opts.deref = DEREF_ALL; }
+    } else if (id == "H" or id == "D") {
+        safe { opts.deref = DEREF_ARGS; }
+    } else if (id == "P") {
+        safe { opts.deref = DEREF_NONE; }
+    } else if (id == "l") {
+        safe { opts.count_links = true; }
+    } else if (id == "S") {
+        safe { opts.separate_dirs = true; }
+    } else if (id == "x") {
+        safe { opts.one_file_system = true; }
+    } else if (id == "0") {
+        safe { opts.zero_terminated = true; }
+    } else if (id == "t") {
+        match parse_size(value, shown, true) {
+            Ok(spec) => {
+                # GNU refuses "-0" (it would mean "at most 0 bytes").
+                if (spec.bytes == 0 and value.startsWith("-")) {
+                    return "invalid --threshold argument '-0'";
+                }
+                safe {
+                    opts.threshold = spec.bytes;
+                    opts.threshold_given = true;
+                }
+            },
+            Err(msg) => { return msg; },
+        }
+    } else if (id == "j") {
+        let n = parse_count(value);
+        if (n < 1 or n > 64) {
+            return i"invalid number of threads '{$ value $}' (1 to 64)";
+        }
+        safe { opts.threads = n; }
+    } else if (id == "X") {
+        safe { opts.exclude_files.push(value); }
+    } else if (id == "exclude") {
+        safe { opts.excludes.push(value); }
+    } else if (id == "help") {
+        safe { opts.help = true; }
+    } else if (id == "version") {
+        safe { opts.version = true; }
+    }
+    return "";
+}
+
+# Parses du's arguments. Err carries the message for "du: MESSAGE".
+pub func parse_args(argv: list[string]): Result[Options, ArgError] {
+    var opts = Options();
+    var only_operands = false;
+    var i = 0;
+    while (i < argv.len()) {
+        let arg = argv[i];
+        i += 1;
+        if (only_operands or arg == "-" or !arg.startsWith("-")) {
+            safe { opts.operands.push(arg); }
+            continue;
+        }
+        if (arg == "--") {
+            only_operands = true;
+            continue;
+        }
+
+        if (arg.startsWith("--")) {
+            # --name, --name=value, --name value
+            let body = arg.slice(2, arg.len());
+            var name = body;
+            var value = "";
+            var has_value = false;
+            let eq = body.index_of("=");
+            if (eq >= 0) {
+                name = body.slice(0, eq);
+                value = body.slice(eq + 1, body.len());
+                has_value = true;
+            }
+            var opt = LongOption("", "", false);
+            match find_long(name, arg) {
+                Ok(found) => { opt = found; },
+                Err(msg) => { return Err(usage_error(msg)); },
+            }
+            if (opt.needs_value and !has_value) {
+                if (i >= argv.len()) {
+                    return Err(usage_error(i"option '--{$ opt.name $}' requires an argument"));
+                }
+                value = argv[i];
+                i += 1;
+            } else if (!opt.needs_value and has_value) {
+                return Err(usage_error(i"option '--{$ opt.name $}' doesn't allow an argument"));
+            }
+            let problem = apply(edits: opts, opt.id, value, "--" + opt.name);
+            if (problem != "") {
+                return Err(ArgError(problem, hint_after(opt.id)));
+            }
+            continue;
+        }
+
+        # A bundle of short options: flags, then possibly one option that
+        # takes the rest of the word (or the next word) as its value.
+        var k = 1;
+        while (k < arg.len()) {
+            let letter = arg.slice(k, k + 1);
+            k += 1;
+            if (SHORT_WITH_VALUE.contains(letter)) {
+                var value = arg.slice(k, arg.len());
+                if (value == "") {
+                    if (i >= argv.len()) {
+                        return Err(usage_error(i"option requires an argument -- '{$ letter $}'"));
+                    }
+                    value = argv[i];
+                    i += 1;
+                }
+                let problem = apply(edits: opts, letter, value, "-" + letter);
+                if (problem != "") {
+                    return Err(ArgError(problem, hint_after(letter)));
+                }
+                k = arg.len();
+            } else if (SHORT_FLAGS.contains(letter)) {
+                let problem = apply(edits: opts, letter, "", "-" + letter);
+                if (problem != "") {
+                    return Err(usage_error(problem));
+                }
+            } else {
+                return Err(usage_error(i"invalid option -- '{$ letter $}'"));
+            }
+        }
+    }
+    return check_options(edits: opts);
+}
+
+# GNU du dies at once on a bad SIZE (-B, -t) without the usage hint.
+func hint_after(id: string): bool {
+    return id != "B" and id != "t";
+}
+
+# The combinations GNU du refuses, and -s as --max-depth=0.
+func check_options(edits opts: Options): Result[Options, ArgError] {
+    if (opts.help or opts.version) {
+        return Ok(opts);
+    }
+    if (opts.summarize and opts.all) {
+        return Err(usage_error("cannot both summarize and show all entries"));
+    }
+    if (opts.summarize and opts.depth_given and opts.max_depth != 0) {
+        return Err(usage_error(i"warning: summarizing conflicts with --max-depth={$ opts.max_depth $}"));
+    }
+    if (opts.summarize) {
+        safe { opts.max_depth = 0; }
+    }
+    return Ok(opts);
+}

@@ -1,0 +1,134 @@
+@mode(host.native)
+
+# Unit tests for du's tree and report (report/tree.lphc,
+# report/report.lphc), with hand-made visits: paths through the parent
+# links, post-order sums, depth, -a, -s, -S, -t, -c, -0 and hard links.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here
+# into its own native binary and runs it. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text);
+from cli.args import (Options, parse_args);
+from report.report import (Report);
+from report.tree import (build_tree);
+from size.units import (fixed_unit);
+from walk.ledger import (Ledger);
+from walk.visit import (Visit, file_visit, dir_visit, error_visit, entry_path);
+
+# A small tree in pre-order (bytes in KiB for readability):
+#   top/        1K
+#     a/        1K
+#       x       4K
+#       y       2K
+#     b         8K
+func sample(): list[Visit] {
+    return [
+        dir_visit("top/", 0, 1024),
+        dir_visit("a", 1, 1024),
+        file_visit("x", 2, 4096),
+        file_visit("y", 2, 2048),
+        file_visit("b", 1, 8192),
+    ];
+}
+
+func options(argv: list[string]): Options {
+    let opts = parse_args(argv).unwrap();
+    if (!opts.block_given) {
+        safe { opts.block = fixed_unit(1024); }
+    }
+    return opts;
+}
+
+# The report's standard-output text for `visits` under `argv`.
+func render(argv: list[string], visits: list[Visit], ledger: Ledger): string {
+    let report = Report(options(argv), ledger);
+    let tree = build_tree(visits);
+    safe { report.emit(tree, 0); }
+    var out: list[string] = [];
+    for (line in report.lines) {
+        if (line.to_stderr) {
+            out.push("ERR " + line.text + "\n");
+        } else {
+            out.push(line.text);
+        }
+    }
+    return out.join("");
+}
+
+func test_paths_follow_parent_links(): void {
+    let tree = build_tree(sample());
+    expectEq(tree.children.len(), 2, "two entries at the top");
+    let a = tree.children[0];
+    expect_text(a.path(), "top/a", "trailing slash of the operand dropped");
+    expect_text(a.children[1].path(), "top/a/y", "two levels down");
+    expectEq(a.children[1].level(), 2, "level from the parent links");
+    expect_text(entry_path("/", "etc"), "/etc", "below the root directory");
+}
+
+func test_directories_in_post_order(): void {
+    let none: list[string] = [];
+    expect_text(render(none, sample(), Ledger()), "7\ttop/a\n16\ttop/\n", "default");
+}
+
+func test_all_entries(): void {
+    expect_text(render(["-a"], sample(), Ledger()),
+        "4\ttop/a/x\n2\ttop/a/y\n7\ttop/a\n8\ttop/b\n16\ttop/\n", "-a");
+}
+
+func test_depth_and_summary(): void {
+    expect_text(render(["-s"], sample(), Ledger()), "16\ttop/\n", "-s");
+    expect_text(render(["-a", "-d", "1"], sample(), Ledger()), "7\ttop/a\n8\ttop/b\n16\ttop/\n", "-a -d 1");
+}
+
+func test_separate_dirs(): void {
+    expect_text(render(["-S"], sample(), Ledger()), "7\ttop/a\n9\ttop/\n", "-S leaves a/ out of top/");
+}
+
+func test_threshold(): void {
+    expect_text(render(["-a", "-t", "5K"], sample(), Ledger()), "7\ttop/a\n8\ttop/b\n16\ttop/\n", "at least 5K");
+    expect_text(render(["-a", "-t", "-4K"], sample(), Ledger()), "4\ttop/a/x\n2\ttop/a/y\n", "at most 4K");
+}
+
+func test_grand_total_and_nul_lines(): void {
+    let report = Report(options(["-c", "-0", "-s"]), Ledger());
+    safe {
+        report.emit(build_tree(sample()), 0);
+        report.add_total();
+    }
+    expectEq(report.lines.len(), 2, "operand and total");
+    expect_text(report.lines[1].text, "16\ttotal" + str(char.of(0)), "NUL-terminated total");
+}
+
+func test_hard_link_counts_once(): void {
+    let ledger = Ledger();
+    let early = "0000000000000000";
+    let late = "0000000000000001";
+    safe {
+        ledger.claim("5:77", late, "00000000");
+        ledger.claim("5:77", early, "00000000");
+    }
+    let visits: list[Visit] = [
+        dir_visit("d", 0, 0),
+        Visit("one", 1, false, true, 4096, "5:77", early, ""),
+        Visit("two", 1, false, true, 4096, "5:77", late, ""),
+    ];
+    expect_text(render(["-a"], visits, ledger), "4\td/one\n4\td\n", "the second link is neither counted nor shown");
+}
+
+func test_errors_in_walk_order(): void {
+    let visits: list[Visit] = [
+        dir_visit("d", 0, 0),
+        error_visit("gone", 1, "cannot access 'd/gone': No such file or directory"),
+        Visit("locked", 1, true, true, 0, "", "", "cannot read directory 'd/locked': Permission denied"),
+    ];
+    expect_text(render(none_args(), visits, Ledger()),
+        "ERR du: cannot access 'd/gone': No such file or directory\nERR du: cannot read directory 'd/locked': Permission denied\n0\td/locked\n0\td\n",
+        "errors where the walk meets them");
+}
+
+func none_args(): list[string] {
+    let none: list[string] = [];
+    return none;
+}

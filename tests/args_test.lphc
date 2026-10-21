@@ -1,0 +1,118 @@
+@mode(host.native)
+
+# Unit tests for du's argument parser (cli/args.lphc): bundles, long-option
+# prefixes and values, conflicts, and GNU's messages.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here,
+# with the modules it imports from source/ and tests/ (both on LOUPPATH),
+# into its own native binary and runs it. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text);
+from cli.args import (Options, parse_args, DEREF_NONE, DEREF_ARGS, DEREF_ALL);
+
+func parsed(argv: list[string]): Options {
+    return parse_args(argv).unwrap();
+}
+
+func message(argv: list[string]): string {
+    match parse_args(argv) {
+        Ok(_) => { return "ok"; },
+        Err(problem) => { return problem.message; },
+    }
+}
+
+func hinted(argv: list[string]): bool {
+    match parse_args(argv) {
+        Ok(_) => { return false; },
+        Err(problem) => { return problem.hint; },
+    }
+}
+
+func test_defaults(): void {
+    let none: list[string] = [];
+    let opts = parsed(none);
+    expect(!opts.all and !opts.summarize and !opts.grand_total, "no flags");
+    expectEq(opts.max_depth, -1, "no depth limit");
+    expectEq(opts.deref, DEREF_NONE, "-P by default");
+    expectEq(opts.operands.len(), 0, "no operands");
+    expect(!opts.block_given, "unit from the environment");
+}
+
+func test_bundled_short_options(): void {
+    let opts = parsed(["-ach", "dir"]);
+    expect(opts.all and opts.grand_total, "-a -c");
+    expectEq(opts.block.human, 1024, "-h");
+    expect_text(opts.operands[0], "dir", "operand");
+    expectEq(parsed(["-d1"]).max_depth, 1, "-d1");
+    expectEq(parsed(["-d", "2"]).max_depth, 2, "-d 2");
+    expectEq(parsed(["-sBM"]).block.factor, 1048576, "-sBM: the rest of the word is the value");
+    expect(parsed(["-sBM"]).summarize, "-s before it");
+}
+
+func test_long_options_and_prefixes(): void {
+    expectEq(parsed(["--max-depth=3"]).max_depth, 3, "--max-depth=3");
+    expectEq(parsed(["--max-depth", "4"]).max_depth, 4, "separate value");
+    expectEq(parsed(["--max=1"]).max_depth, 1, "prefix");
+    expect(parsed(["--apparent"]).apparent, "--apparent");
+    expectEq(parsed(["--si"]).block.human, 1000, "--si is exact, not a prefix of --summarize");
+    expectEq(parsed(["--dereference"]).deref, DEREF_ALL, "--dereference");
+    expectEq(parsed(["--dereference-args"]).deref, DEREF_ARGS, "--dereference-args");
+    expectEq(parsed(["-L", "-P"]).deref, DEREF_NONE, "last one wins");
+    let opts = parsed(["--exclude=*.o", "--exclude", "tmp", "-X", "list"]);
+    expectEq(opts.excludes.len(), 2, "two patterns");
+    expect_text(opts.excludes[1], "tmp", "in order");
+    expect_text(opts.exclude_files[0], "list", "-X FILE");
+}
+
+func test_options_after_operands_and_double_dash(): void {
+    let opts = parsed(["a", "-s", "--", "-b"]);
+    expect(opts.summarize, "-s after an operand");
+    expectEq(opts.operands.len(), 2, "two operands");
+    expect_text(opts.operands[1], "-b", "after --");
+    expect_text(parsed(["-"]).operands[0], "-", "a lone dash is an operand");
+}
+
+func test_units_and_bytes(): void {
+    let b = parsed(["-b"]);
+    expect(b.apparent, "-b means apparent size");
+    expectEq(b.block.factor, 1, "in bytes");
+    expectEq(parsed(["-k"]).block.factor, 1024, "-k");
+    expectEq(parsed(["-m"]).block.factor, 1048576, "-m");
+    expectEq(parsed(["-h", "-k"]).block.human, 0, "-k after -h wins");
+    expectEq(parsed(["-t", "1K"]).threshold, 1024, "-t");
+    expectEq(parsed(["--threshold=-2K"]).threshold, 0 - 2048, "negative threshold");
+    expectEq(parsed(["-j", "3"]).threads, 3, "-j");
+}
+
+func test_summarize(): void {
+    expectEq(parsed(["-s"]).max_depth, 0, "-s is depth 0");
+    expectEq(parsed(["-s", "-d", "0"]).max_depth, 0, "-s with -d 0 is fine");
+    expect_text(message(["-s", "-a"]), "cannot both summarize and show all entries", "-s -a");
+    expect_text(message(["-s", "--max-depth=2"]), "warning: summarizing conflicts with --max-depth=2", "-s -d 2");
+}
+
+func test_getopt_messages(): void {
+    expect_text(message(["-q"]), "invalid option -- 'q'", "unknown short");
+    expect_text(message(["--bogus=1"]), "unrecognized option '--bogus=1'", "unknown long");
+    expect_text(message(["-d"]), "option requires an argument -- 'd'", "missing short value");
+    expect_text(message(["--max-depth"]), "option '--max-depth' requires an argument", "missing long value");
+    expect_text(message(["--all=3"]), "option '--all' doesn't allow an argument", "value on a flag");
+    expect_text(message(["--s"]), "option '--s' is ambiguous; possibilities: '--si' '--separate-dirs' '--summarize'", "ambiguous");
+    expect_text(message(["-d", "x"]), "invalid maximum depth 'x'", "bad depth");
+    expect_text(message(["-j", "0"]), "invalid number of threads '0' (1 to 64)", "bad thread count");
+    expect(hinted(["-q"]), "usage errors get the hint");
+}
+
+func test_size_errors_have_no_hint(): void {
+    expect_text(message(["-B", "0"]), "invalid -B argument '0'", "-B 0");
+    expect_text(message(["--block-size=1x"]), "invalid suffix in --block-size argument '1x'", "long name in the message");
+    expect_text(message(["-t", "-0"]), "invalid --threshold argument '-0'", "-t -0");
+    expect(!hinted(["-B", "0"]), "no hint after a bad SIZE");
+}
+
+func test_help_and_version_skip_checks(): void {
+    expect(parsed(["--help", "-s", "-a"]).help, "--help wins over a conflict");
+    expect(parsed(["--vers"]).version, "--version by prefix");
+}

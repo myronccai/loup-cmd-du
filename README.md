@@ -1,24 +1,27 @@
-# template Loup commandline application
+# loup-cmd-du
 
-A GitHub template for a command-line application written in
-[Loup](https://code-craft.ai/references/loup). It includes argument parsing,
-command dispatch, a sample `hello` command, tests, a native build and a CI
-workflow.
+GNU `du` in [Loup](https://code-craft.ai/references/loup): estimate the
+disk space used by files and directory trees. It walks each directory with
+several worker threads and still prints the same lines in the same order on
+every run, counts hard links once, and takes its sizes from `lstat(2)`
+through the C library.
 
-After creating a repository from this template, work through
-[REPOSITORY_TODOS.md](REPOSITORY_TODOS.md).
+Part of the **loup-cmd** series of example applications: classic Linux and
+Windows commands, and projects for each Loup execution mode, each in its own
+repository under [myronccai](https://github.com/myronccai?tab=repositories&q=loup-cmd).
+This one is a `host.native` (host-compiled) command.
 
 ## Requirements
 
+- Linux x86-64 with glibc (the `struct stat` layout and the `open(2)` flags
+  are Linux's; the directory listing goes through `/proc/self/fd`).
 - [Loup Lite](https://github.com/code-craft-ai-company/loup-releases) 1.26.0
   or later; see [Installing Loup Lite](#installing-loup-lite).
-- `make`
-- `clang` 17 or later for native builds. Native builds are supported on Linux
-  x86-64 and arm64, and are a preview on macOS and Windows.
+- `make`, and `clang` 17 or later for the native build.
 
 ## Installing Loup Lite
 
-This project is built and tested with **Loup Lite**, the free public build of
+This example is built and tested with **Loup Lite**, the free public build of
 the Loup toolchain from [Code Craft AI](https://code-craft.ai), meant for
 education and training. Code Craft AI publishes the official builds,
 installers and signed checksums at
@@ -61,70 +64,189 @@ check it against `SHA256SUMS`, unpack it anywhere and add its `bin` directory to
 explains how to verify the Sigstore signature on `SHA256SUMS`.
 
 Loup Lite leaves out Loup's cryptography library and the full set of Loup
-packages; this project needs neither. Commercial use of Loup needs a
+packages; this example needs neither. Commercial use of Loup needs a
 license: <https://code-craft.ai/loup/license>.
 
 ## Usage
 
 ```sh
-make run ARGS="--help"            # run from source
-make run ARGS="hello Ann --shout"
-make check                        # type-check the program
-make test                         # run the tests in tests/
-make build                        # native binary: build/myapp
-make ci                           # check, test, build and smoke-test the binary
-make clean
+make build                         # native binary: build/du
+make ci                            # check, native unit tests, build, end-to-end tests
+make run ARGS="-sh /usr/share"     # build, then run with ARGS
 ```
+
+The binary is built by the self-hosted compiler (`loup build --target
+native`). `make check` and the unit tests use Stage0 (`loup-bootstrap`),
+whose test runner compiles each test into a native binary, so the code
+sticks to what both native back ends compile the same way.
+
+A small project tree; `-b` is `--apparent-size --block-size=1`, sizes in
+bytes. `proj/build/app-latest` is a hard link to `proj/build/app`, and
+`proj/run` a symbolic link to it:
 
 ```text
-$ build/myapp --help
-usage: myapp [OPTIONS] COMMAND [ARGS...]
-
-A command-line application written in Loup.
-
-Commands:
-  hello [NAME]          Print a greeting (NAME defaults to 'world')
-  help                  Show this help
-
-Options:
-  -g, --greeting TEXT   Greeting used by 'hello' (default: Hello)
-      --shout           Print the greeting in upper case
-  -v, --verbose         Print diagnostic messages to stderr
-  -h, --help            Show this help and exit
-  -V, --version         Show the version and exit
+$ du -ab proj
+500	proj/README
+20000	proj/build/app
+6000	proj/build/app.o
+26000	proj/build
+3000	proj/docs/guide.md
+3000	proj/docs
+9	proj/run
+1200	proj/src/main.c
+800	proj/src/util.c
+2000	proj/src
+31509	proj
+$ du -ab -l proj | grep build
+20000	proj/build/app
+20000	proj/build/app-latest
+6000	proj/build/app.o
+46000	proj/build
+$ du -b -d 1 --exclude='*.o' proj
+20000	proj/build
+3000	proj/docs
+2000	proj/src
+25509	proj
+$ du -sbc proj/src proj/docs
+2000	proj/src
+3000	proj/docs
+5000	total
+$ du -sh proj
+44K	proj
 ```
 
-Exit status: `0` success, `1` runtime failure, `2` usage error.
+The hard link is counted and listed once, where the walk meets it first;
+`-l` counts it twice. Disk usage (without `-b`) is allocated blocks, so it
+depends on the file system. On a real tree:
+
+```text
+$ du -sh /usr/share/doc /usr/share/man /usr/share/locale
+177M	/usr/share/doc
+49M	/usr/share/man
+71M	/usr/share/locale
+$ du nope proj/README
+du: cannot access 'nope': No such file or directory
+4	proj/README
+$ echo $?
+1
+```
+
+## Options
+
+| Option | Meaning |
+|---|---|
+| `-a`, `--all` | list files too, not only directories |
+| `--apparent-size` | `st_size` instead of allocated blocks (directories count 0, as in GNU du) |
+| `-B`, `--block-size=SIZE` | print sizes in units of SIZE (`1M`, `KB`, `4096`; a unit alone is printed after each size: `-BK` gives `12K`) |
+| `-b`, `--bytes` | `--apparent-size --block-size=1` |
+| `-c`, `--total` | end with a grand total |
+| `-D`, `-H`, `--dereference-args` | follow symbolic links named on the command line |
+| `-d`, `--max-depth=N` | list entries at most N levels below an operand |
+| `-h`, `--human-readable` / `--si` | `4.0K`, `12M` (powers of 1024) / `4.1k` (powers of 1000) |
+| `-j`, `--threads=N` | worker threads, 1 to 64 (default: one per CPU, at most 8) |
+| `-k` / `-m` | units of 1024 / 1048576 bytes |
+| `-L`, `--dereference` | follow all symbolic links (a link to an ancestor is skipped) |
+| `-l`, `--count-links` | count a hard-linked file at every link |
+| `-P`, `--no-dereference` | follow no symbolic links (the default) |
+| `-S`, `--separate-dirs` | a directory's size leaves out its subdirectories |
+| `-s`, `--summarize` | only the operands (`--max-depth=0`) |
+| `-t`, `--threshold=SIZE` | leave out entries smaller than SIZE (larger than -SIZE if negative) |
+| `--exclude=PATTERN`, `-X`, `--exclude-from=FILE` | skip what matches a shell pattern (`*` also matches `/`; tried on the whole path and on every part after a `/`) |
+| `-x`, `--one-file-system` | skip everything on another file system |
+| `-0`, `--null` | end lines with NUL instead of newline |
+| `--help`, `--version` | |
+
+Short options bundle (`-sh`, `-d1`, `-BM`), long options accept unambiguous
+prefixes (`--max=1`), options may follow operands, and `--` ends them. With
+no operand du walks `.`. Without a unit option the unit is the first of
+`DU_BLOCK_SIZE`, `BLOCK_SIZE` and `BLOCKSIZE` that is set, else 1024 bytes
+(512 with `POSIXLY_CORRECT`).
+
+Exit status: `0` success, `1` if any file could not be read, or on a usage
+error.
+
+## Differences from the original
+
+- Entries are walked and listed in byte order of their names (GNU du uses
+  the order the file system returns them in). The order decides which hard
+  link is counted, so the two can charge a link to different directories;
+  totals agree.
+- `-j N` / `--threads=N` is new.
+- Not implemented: `--files0-from`, `--inodes`, `--time`, `--time-style`.
+- A `--max-depth` below 0 is an error; SIZE values must fit in a signed
+  64-bit integer (`-B 10E` is "too large").
+- A directory cycle through a bind mount is skipped silently; GNU du warns
+  about it.
+- Error messages for `errno` values other than the common ones (ENOENT,
+  EACCES, ENOTDIR, ELOOP, ...) are `Unknown error N`.
+
+## What this example shows
+
+- **OS threads with a deterministic result.** `walk/walker.lphc` gives each
+  top-level subdirectory of an operand to a pool of `Thread.spawnWith`
+  workers that take jobs from a `synchronized class JobQueue`. Nothing is
+  printed during the walk: each worker records its job's entries in its own
+  list, in the order a single-threaded walk would meet them, and hands it to
+  a `synchronized class Harvest` under the job number; after `join()` the
+  lists are spliced in name order. The output is the same for `-j 1` and
+  `-j 16` (the end-to-end tests check it).
+- **A `synchronized class` with a rule that does not care who comes first.**
+  `walk/ledger.lphc` keeps the seen-inode set and the walk's totals. Every
+  entry that may be a repeat claims its `dev:ino` with a *walk key* (eight
+  hex digits per level, so string order is pre-order); the ledger keeps the
+  smallest key, which is the entry a sequential walk would have counted.
+- **`RwLock`.** The exclude patterns (`walk/excludes.lphc`) are read by every
+  worker under a read lock and published under the write lock; Loup 1.26's
+  `RwLock` holds an `int`, so the lock's value is the number of published
+  patterns.
+- **`Sendable`, checked and asserted.** `ExcludeList`, `FileInfo`, `Visit`
+  and the job records are `Sendable` because their fields are immutable. The
+  parsed `Options` has plain `var` fields that only the parser writes, before
+  any thread starts: that protocol is stated with
+  `@unsafe("sendable: ...")`.
+- **A `unique class` that owns a descriptor.** `DirHandle`
+  (`fs/files.lphc`) wraps `open(path, O_DIRECTORY)`; entries are stat'ed with
+  `fstatat` relative to it and listed through `/proc/self/fd/N`. Its
+  `finalize()` closes the descriptor; the walker `del`s the handle before it
+  descends, so a thread holds one descriptor at a time, and a unit test opens
+  3,000 handles in a row to prove none leaks. It is lent out as
+  `borrow dir: DirHandle`.
+- **`unowned` parent links.** The report (`report/tree.lphc`) builds an
+  `Entry[lifetime ~tree]` tree whose `unowned[~tree] var parent` does not
+  keep the parent alive; each entry stores only its name and finds its path
+  by following the parents.
+- **Calling C with `@repr(C)` structs.** `struct stat` is declared field by
+  field with C's `st_` names (144 bytes, checked with `size_of`), filled by
+  `lstat`/`stat`/`fstatat` through `edits buf: StatBuf`, and copied into a
+  `FileInfo` class at once. `errno` comes from `__errno_location()`, copied
+  out with `memcpy` into a one-field C struct. The `extern native`
+  declarations carry `@unsafe("threadSafe: ...")`.
 
 ## Layout
 
 ```text
-package.lppkg            # Loup manifest
-Makefile                 # run, check, test, build, ci, clean
-LICENSE                  # MIT license
-source/                  # the application's Loup code
-├── main.loup            # entry point
-├── cli/                 # argument parsing, help text, command dispatch
-└── commands/            # one module per command
-tests/                   # *_test.loup files
-specs/                   # feature specs: requirements, design, tasks
-skills/loup-programmer/  # agent skill for writing Loup
+source/main.lphc              # entry point
+source/appinfo.lphc           # name, version, exit statuses, thread limits
+source/cli/args.lphc          # Options (@unsafe sendable), getopt-style parse_args()
+source/cli/usage.lphc         # --help and --version text
+source/cli/app.lphc           # run(): parse, help/version, unit from the environment
+source/size/units.lphc        # SIZE parsing, block sizes, -h/--si formatting
+source/fs/files.lphc          # @repr(C) struct stat, libc calls, errno, unique class DirHandle
+source/walk/excludes.lphc     # shell patterns, ExcludeList under an RwLock
+source/walk/ledger.lphc       # synchronized class Ledger, walk keys
+source/walk/visit.lphc        # Visit: one walked entry
+source/walk/walker.lphc       # the parallel walk: JobQueue, Harvest, workers
+source/report/tree.lphc       # Entry tree with unowned parent links
+source/report/report.lphc     # post-order sums and lines, grand total
+source/commands/du.lphc       # run_du(): operands, output, exit status
+tests/*_test.lphc             # native unit tests (make test)
+tests/helpers.lphc            # expect_text(), scratch files and links
+tests/e2e.sh                  # end-to-end tests of build/du (make e2e)
+specs/du/                     # requirements, design, tasks
 ```
 
-[AGENTS.md](AGENTS.md) has the full layout, every build and test command, and
-the steps for adding a command.
-
-## Notes on the toolchain
-
-- On Linux x86-64, `loup` is the self-hosted driver and `loup-bootstrap` is
-  Stage0. `check` and `test` use `loup-bootstrap`; on other platforms both
-  names run the same tool. The Makefile handles this.
-- Modules import each other by their path under `source/`
-  (`from cli.args import (Options);`). Tests import them the same way, which
-  is why `make test` puts `source/` on `LOUPPATH`.
-- The Wasm build (`loup-bootstrap build`) is experimental: modules that use
-  `i"..."` interpolation build but trap at run time, so this template builds
-  native binaries.
+[AGENTS.md](AGENTS.md) has every build and test command and the conventions
+for changing the code.
 
 ## License
 

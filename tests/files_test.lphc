@@ -1,0 +1,96 @@
+@mode(host.native)
+
+# Unit tests for du's libc layer (fs/files.lphc): the C layout of
+# `struct stat`, lstat/stat, errno, and DirHandle (listing, fstatat, and
+# closing its descriptor).
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here
+# into its own native binary and runs it in a fresh temporary directory,
+# where these tests create their files. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text, make_dir, make_file, make_hard_link, make_symlink);
+from fs.files import (DirHandle, FileInfo, stat_path, errno_text, size_of_stat_buf);
+
+func test_struct_stat_layout(): void {
+    # x86-64 glibc: sizeof(struct stat) == 144.
+    expectEq(size_of_stat_buf(), 144, "size_of[StatBuf]()");
+}
+
+func test_lstat_a_file(): void {
+    make_file("f5000", 5000);
+    let info = stat_path("f5000", false).unwrap();
+    expectEq(info.size, 5000, "st_size");
+    expect(info.is_regular() and !info.is_dir() and !info.is_link(), "a regular file");
+    expectEq(info.nlink, 1, "one link");
+    expect(info.blocks >= 0, "st_blocks");
+}
+
+func test_links(): void {
+    make_file("orig", 10);
+    make_hard_link("orig", "twin");
+    make_symlink("orig", "sym");
+    let a = stat_path("orig", false).unwrap();
+    let b = stat_path("twin", false).unwrap();
+    expectEq(a.nlink, 2, "two links");
+    expect_text(a.inode_key(), b.inode_key(), "same dev:ino");
+    expect(stat_path("sym", false).unwrap().is_link(), "lstat sees the link");
+    expect(stat_path("sym", true).unwrap().is_regular(), "stat follows it");
+}
+
+func test_errno_of_a_missing_file(): void {
+    match stat_path("no/such/file", false) {
+        Ok(_) => { expect(false, "should fail"); },
+        Err(code) => { expect_text(errno_text(code), "No such file or directory", "ENOENT"); },
+    }
+    expect_text(errno_text(13), "Permission denied", "EACCES");
+    expect_text(errno_text(9999), "Unknown error 9999", "unknown");
+}
+
+func test_dir_handle_lists_and_stats(): void {
+    make_dir("listing/sub");
+    make_file("listing/b", 3);
+    make_file("listing/a", 1);
+    make_file("listing/.hidden", 2);
+    unique let dir = DirHandle("listing");
+    expect(dir.is_open(), "open");
+    let names = dir.names();
+    expectEq(names.len(), 4, "dot-files too, no . or ..");
+    expect_text(names[0], ".hidden", "byte order");
+    expect_text(names[1], "a", "a");
+    expect_text(names[3], "sub", "sub");
+    expectEq(dir.stat_entry("b", false).unwrap().size, 3, "fstatat relative to the directory");
+    expect(dir.stat_entry("sub", false).unwrap().is_dir(), "a directory");
+    expect(dir.stat_entry("zzz", false).is_err(), "missing entry");
+}
+
+func test_dir_handle_open_errors(): void {
+    unique let missing = DirHandle("not-there");
+    expect(!missing.is_open(), "missing");
+    expect_text(errno_text(missing.error), "No such file or directory", "ENOENT");
+    make_file("plain", 1);
+    unique let file = DirHandle("plain");
+    expect_text(errno_text(file.error), "Not a directory", "ENOTDIR");
+}
+
+func open_and_drop(path: string): bool {
+    unique let dir = DirHandle(path);
+    return dir.is_open();
+}
+
+# finalize() closes the descriptor at the end of each scope: far more
+# handles than the usual limit of 1024 open files are opened one after the
+# other, and every one of them opens.
+func test_handles_are_closed(): void {
+    make_dir("many");
+    var opened = 0;
+    var k = 0;
+    while (k < 3000) {
+        if (open_and_drop("many")) {
+            opened += 1;
+        }
+        k += 1;
+    }
+    expectEq(opened, 3000, "no descriptor leaked");
+}

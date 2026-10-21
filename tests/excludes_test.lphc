@@ -1,0 +1,89 @@
+@mode(host.native)
+
+# Unit tests for du's exclude patterns (walk/excludes.lphc): the shell
+# pattern matcher, GNU's path rule, and the shared ExcludeList read by
+# several threads.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here
+# into its own native binary and runs it. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from walk.excludes import (Glob, ExcludeList, excluded_path);
+
+func test_literal_and_wildcards(): void {
+    expect(Glob("abc").matches("abc"), "literal");
+    expect(!Glob("abc").matches("abcd"), "whole text only");
+    expect(Glob("a?c").matches("abc"), "?");
+    expect(!Glob("a?c").matches("ac"), "? needs a character");
+    expect(Glob("*.o").matches("main.o"), "*");
+    expect(Glob("*.o").matches("src/main.o"), "* crosses slashes");
+    expect(Glob("*").matches(".hidden"), "* matches a leading dot");
+    expect(Glob("a*b*c").matches("aXXbYYbc"), "backtracking");
+    expect(!Glob("a*b*c").matches("aXXbYY"), "no final c");
+    expect(Glob("**").matches(""), "stars match nothing");
+}
+
+func test_bracket_expressions(): void {
+    expect(Glob("[abc]x").matches("bx"), "set");
+    expect(!Glob("[abc]x").matches("dx"), "not in the set");
+    expect(Glob("[a-c]").matches("b"), "range");
+    expect(Glob("[!a-c]").matches("d"), "negated with !");
+    expect(Glob("[^a-c]").matches("d"), "negated with ^");
+    expect(!Glob("[!a-c]").matches("a"), "negated miss");
+    expect(Glob("[]a]").matches("]"), "leading ] is literal");
+    expect(Glob("[a-]").matches("-"), "trailing - is literal");
+    expect(Glob("[").matches("["), "unterminated [ is literal");
+    expect(Glob("é[éè]").matches("éè"), "non-ASCII code points");
+}
+
+func test_backslash_escapes(): void {
+    expect(Glob("\\*").matches("*"), "escaped star");
+    expect(!Glob("\\*").matches("x"), "escaped star is literal");
+    expect(Glob("a\\?").matches("a?"), "escaped question mark");
+}
+
+func test_gnu_path_rule(): void {
+    expect(excluded_path(Glob("*.o"), "src/a.o"), "whole path");
+    expect(excluded_path(Glob("a.o"), "src/a.o"), "the part after a slash");
+    expect(excluded_path(Glob("b/c"), "a/b/c"), "several components");
+    expect(!excluded_path(Glob("b"), "a/b/c"), "not a middle component alone");
+    expect(excluded_path(Glob("t"), "t"), "the operand itself");
+    expect(!excluded_path(Glob("x"), "ax"), "no partial names");
+}
+
+func test_list_matches_published_patterns(): void {
+    let list = ExcludeList();
+    expect(!list.excludes("a/b.tmp"), "empty list");
+    safe {
+        list.add("*.tmp");
+        list.add("cache");
+    }
+    expectEq(list.len(), 2, "two published");
+    expect(list.excludes("a/b.tmp"), "first pattern");
+    expect(list.excludes("x/cache"), "second pattern");
+    expect(!list.excludes("x/cached"), "neither");
+}
+
+# Several threads read the list at once, under the read lock.
+func count_hits(list: ExcludeList, n: int): int {
+    var hits = 0;
+    var k = 0;
+    while (k < n) {
+        if (list.excludes(i"dir/{$ k $}.tmp")) {
+            hits += 1;
+        }
+        k += 1;
+    }
+    return hits;
+}
+
+func test_concurrent_readers(): void {
+    let list = ExcludeList();
+    safe { list.add("*.tmp"); }
+    let a = Thread.spawnWith(func(): int { return count_hits(list, 300); });
+    let b = Thread.spawnWith(func(): int { return count_hits(list, 300); });
+    let c = Thread.spawnWith(func(): int { return count_hits(list, 300); });
+    let total: int = a.join() + b.join() + c.join();
+    expectEq(total, 900, "every reader saw the pattern");
+}

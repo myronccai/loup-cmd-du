@@ -1,0 +1,241 @@
+@mode(host.native)
+
+# du's units: SIZE arguments (-B, -t and the block-size environment
+# variables) and the printed form of a size (whole units, -h, --si).
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler). Pure functions; tests/units_test.lphc
+# checks them in native test binaries (Stage0).
+#
+# Structure: the SIZE grammar (parse_size), the BlockSize the output uses
+# and where it comes from (options, then the environment), then the
+# formatting: ceil(bytes / unit), or a human-readable unit per size.
+
+# Unit letters in increasing powers: K = 1, M = 2, ... Y = 8.
+const UNIT_LETTERS: string = "KMGTPEZY";
+const INT_MAX: int = 9223372036854775807;
+
+# A parsed SIZE: its value in bytes, and the unit text to print after each
+# size when SIZE was a unit alone ("-BK" prints "12K"; "-B1K" prints "12").
+pub class SizeSpec {
+    pub let bytes: int;
+    pub let suffix: string;
+
+    new(bytes: int, suffix: string) {
+        this.bytes = bytes;
+        this.suffix = suffix;
+    }
+}
+
+# How sizes are printed. `human` is 0 for a fixed unit of `factor` bytes,
+# or the base (1024 for -h, 1000 for --si) of a unit chosen per size.
+pub class BlockSize {
+    pub let factor: int;
+    pub let human: int;
+    pub let suffix: string;
+
+    new(factor: int, human: int, suffix: string) {
+        this.factor = factor;
+        this.human = human;
+        this.suffix = suffix;
+    }
+}
+
+pub func fixed_unit(factor: int): BlockSize {
+    return BlockSize(factor, 0, "");
+}
+
+pub func human_unit(base: int): BlockSize {
+    return BlockSize(1, base, "");
+}
+
+func digit_value(ch: string): int {
+    return "0123456789".index_of(ch);
+}
+
+# The power of a unit letter (K/k = 1 ... Y = 8), or 0.
+func letter_power(ch: string): int {
+    return UNIT_LETTERS.index_of(ch.toUpperCase()) + 1;
+}
+
+# base ** power, or -1 when it does not fit in an int.
+func checked_power(base: int, power: int): int {
+    var value = 1;
+    var k = 0;
+    while (k < power) {
+        if (value > INT_MAX / base) {
+            return -1;
+        }
+        value = value * base;
+        k += 1;
+    }
+    return value;
+}
+
+# Parses SIZE: an optional number of decimal digits, then an optional unit
+# letter followed by nothing (powers of 1024), "B" (powers of 1000) or "iB"
+# (powers of 1024). `option` names the option in messages ("-B", "-t");
+# with `signed`, a leading '-' is allowed (-t). Errors are GNU's messages.
+pub func parse_size(text: string, option: string, signed: bool): Result[SizeSpec, string] {
+    let invalid = i"invalid {$ option $} argument '{$ text $}'";
+    var at = 0;
+    var negative = false;
+    if (signed and text.startsWith("-")) {
+        negative = true;
+        at = 1;
+    }
+    var number = 0;
+    var digits = 0;
+    while (at < text.len() and digit_value(text.slice(at, at + 1)) >= 0) {
+        let d = digit_value(text.slice(at, at + 1));
+        if (number > (INT_MAX - d) / 10) {
+            return Err(i"{$ option $} argument '{$ text $}' too large");
+        }
+        number = number * 10 + d;
+        digits += 1;
+        at += 1;
+    }
+    let rest = text.slice(at, text.len());
+    if (digits == 0 and rest.len() == 0) {
+        return Err(invalid);
+    }
+    if (rest.len() == 0) {
+        return Ok(SizeSpec(if (negative) { 0 - number } else { number }, ""));
+    }
+
+    # A unit: one letter, then "", "B" or "iB".
+    let letter = rest.slice(0, 1);
+    let power = letter_power(letter);
+    if (power == 0) {
+        # Without digits the whole argument is wrong ("-B b"); after
+        # digits only its suffix is ("-B 1b").
+        if (digits == 0) {
+            return Err(invalid);
+        }
+        return Err(i"invalid suffix in {$ option $} argument '{$ text $}'");
+    }
+    let tail = rest.slice(1, rest.len());
+    if (tail != "" and tail != "B" and tail != "iB") {
+        return Err(i"invalid suffix in {$ option $} argument '{$ text $}'");
+    }
+    let base = if (tail == "B") { 1000 } else { 1024 };
+    let unit = checked_power(base, power);
+    if (digits == 0) {
+        number = 1;
+    }
+    if (unit < 0 or number > INT_MAX / unit) {
+        return Err(i"{$ option $} argument '{$ text $}' too large");
+    }
+    let bytes = number * unit;
+    # GNU prints a 1000-based kilo as "k" and every other letter in upper
+    # case: "kB", "KiB", "MB", "K".
+    var shown = letter.toUpperCase();
+    if (tail == "B" and shown == "K") {
+        shown = "k";
+    }
+    let suffix = if (digits == 0) { shown + tail } else { "" };
+    return Ok(SizeSpec(if (negative) { 0 - bytes } else { bytes }, suffix));
+}
+
+# The BlockSize of a -B argument (also "human-readable", any prefix of it
+# down to "human", and "si"). `option` is the option as the user wrote it,
+# for the messages ("-B", "--block-size").
+pub func parse_block_size(text: string, option: string): Result[BlockSize, string] {
+    if (text.len() >= 5 and "human-readable".startsWith(text)) {
+        return Ok(human_unit(1024));
+    }
+    if (text == "si") {
+        return Ok(human_unit(1000));
+    }
+    match parse_size(text, option, false) {
+        Ok(spec) => {
+            if (spec.bytes <= 0) {
+                return Err(i"invalid {$ option $} argument '{$ text $}'");
+            }
+            return Ok(BlockSize(spec.bytes, 0, spec.suffix));
+        },
+        Err(msg) => { return Err(msg); },
+    }
+}
+
+# The default unit when no option sets one: DU_BLOCK_SIZE, BLOCK_SIZE or
+# BLOCKSIZE (the first one set; an invalid value counts as unset), else
+# 512 under POSIXLY_CORRECT, else 1024. The values are passed in so that
+# tests need not change the environment.
+pub func block_size_from_env(du_block_size: string, block_size: string, blocksize: string, posixly_correct: bool): BlockSize {
+    var spec = du_block_size;
+    if (spec == "") {
+        spec = block_size;
+    }
+    if (spec == "") {
+        spec = blocksize;
+    }
+    if (spec != "") {
+        match parse_block_size(spec, "-B") {
+            Ok(bs) => { return bs; },
+            Err(_) => {},
+        }
+    }
+    return fixed_unit(if (posixly_correct) { 512 } else { 1024 });
+}
+
+# ceil(a / b) for a >= 0, b > 0, without overflowing a + b - 1.
+pub func ceil_div(a: int, b: int): int {
+    let q = a / b;
+    return if (a % b == 0) { q } else { q + 1 };
+}
+
+# Units of the human-readable forms: index 1 is K (k with --si).
+func human_letter(power: int, base: int): string {
+    if (power == 1 and base == 1000) {
+        return "k";
+    }
+    return UNIT_LETTERS.slice(power - 1, power);
+}
+
+# GNU's -h/--si text: the largest unit not above the size, rounded up;
+# one decimal while the number is below 10 ("4.0K", "9.9M"), none from 10
+# on ("10K", "1000K"), and a size that rounds up to a whole next unit is
+# written in that unit ("1.0M" for 1048575 bytes with -h).
+pub func human_size(bytes: int, base: int): string {
+    if (bytes < base) {
+        return str(bytes);
+    }
+    var unit = 1;
+    var power = 0;
+    while (power < 6 and bytes / unit >= base) {
+        unit = unit * base;
+        power += 1;
+    }
+    let whole = bytes / unit;
+    let rest = bytes % unit;
+    if (whole < 10) {
+        # Tenths, rounded up. rest * 10 would overflow in the largest
+        # units, so scale both down first there; the error is far below
+        # one tenth.
+        var r = rest;
+        var u = unit;
+        while (u > 1099511627776) {
+            r = ceil_div(r, 1024);
+            u = u / 1024;
+        }
+        let tenths = whole * 10 + ceil_div(r * 10, u);
+        if (tenths < 100) {
+            return i"{$ tenths / 10 $}.{$ tenths % 10 $}" + human_letter(power, base);
+        }
+        return "10" + human_letter(power, base);
+    }
+    let rounded = if (rest > 0) { whole + 1 } else { whole };
+    if (rounded >= base and power < 6) {
+        return "1.0" + human_letter(power + 1, base);
+    }
+    return str(rounded) + human_letter(power, base);
+}
+
+# The printed form of a size in bytes.
+pub func format_size(bytes: int, bs: BlockSize): string {
+    if (bs.human > 0) {
+        return human_size(bytes, bs.human);
+    }
+    return str(ceil_div(bytes, bs.factor)) + bs.suffix;
+}

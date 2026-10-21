@@ -1,0 +1,76 @@
+@mode(host.native)
+
+# The --help text and the --version line of du.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler); tests/app_test.lphc checks both
+# through run() in native test binaries (Stage0).
+
+from appinfo import (APP_NAME, APP_VERSION, APP_SUMMARY, DEFAULT_MAX_THREADS);
+
+pub func usage(): string {
+    # The option table interpolates nothing, so it is one multiline string:
+    # its lines start at the indentation of the `let`, which is stripped,
+    # and the newlines right after the opening and before the closing
+    # quotes are dropped.
+    let options = """
+    Mandatory arguments to long options are mandatory for short options too.
+      -0, --null            end each output line with NUL, not newline
+      -a, --all             write counts for all files, not just directories
+          --apparent-size   print apparent sizes (st_size) rather than device
+                              usage (st_blocks)
+      -B, --block-size=SIZE  scale sizes by SIZE before printing them; e.g.,
+                               '-BM' prints sizes in units of 1,048,576 bytes
+      -b, --bytes           equivalent to '--apparent-size --block-size=1'
+      -c, --total           produce a grand total
+      -D, --dereference-args  dereference only symlinks that are listed on the
+                              command line
+      -d, --max-depth=N     print the total for a directory (or file, with --all)
+                              only if it is N or fewer levels below the command
+                              line argument; --max-depth=0 is the same as
+                              --summarize
+      -H                    equivalent to --dereference-args (-D)
+      -h, --human-readable  print sizes in human readable format (e.g., 1K 234M 2G)
+      -j, --threads=N       walk with N worker threads (1 to 64)
+      -k                    like --block-size=1K
+      -L, --dereference     dereference all symbolic links
+      -l, --count-links     count sizes many times if hard linked
+      -m                    like --block-size=1M
+      -P, --no-dereference  don't follow any symbolic links (this is the default)
+      -S, --separate-dirs   for directories do not include size of subdirectories
+          --si              like -h, but use powers of 1000 not 1024
+      -s, --summarize       display only a total for each argument
+      -t, --threshold=SIZE  exclude entries smaller than SIZE if positive,
+                              or entries greater than SIZE if negative
+      -X, --exclude-from=FILE  exclude files that match any pattern in FILE
+          --exclude=PATTERN    exclude files that match PATTERN
+      -x, --one-file-system    skip directories on different file systems
+          --help        display this help and exit
+          --version     output version information and exit
+
+    Display values are in units of the first available SIZE from --block-size,
+    and the DU_BLOCK_SIZE, BLOCK_SIZE and BLOCKSIZE environment variables.
+    Otherwise, units default to 1024 bytes (or 512 if POSIXLY_CORRECT is set).
+
+    The SIZE argument is an integer and optional unit (example: 10K is 10*1024).
+    Units are K,M,G,T,P,E,Z,Y (powers of 1024) or KB,MB,... (powers of 1000).
+    Binary prefixes can be used, too: KiB=K, MiB=M, and so on.
+    """;
+    let lines = [
+        i"Usage: {$ APP_NAME $} [OPTION]... [FILE]...",
+        APP_SUMMARY,
+        "",
+        options,
+        "",
+        "Entries are walked and listed in byte order of their names. Each operand's",
+        i"subdirectories are walked by worker threads (by default one per CPU, at most",
+        i"{$ DEFAULT_MAX_THREADS $}); the output does not depend on how many.",
+        "",
+        "Exit status: 0 if every file was read, 1 otherwise or on a usage error.",
+    ];
+    return lines.join("\n");
+}
+
+pub func version_line(): string {
+    return i"{$ APP_NAME $} (loup-cmd-{$ APP_NAME $}) {$ APP_VERSION $}";
+}

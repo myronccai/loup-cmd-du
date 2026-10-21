@@ -1,0 +1,96 @@
+@mode(host.native)
+
+# du's ledger, shared by every worker thread: the seen-inode set that makes
+# hard links (and repeated directories) count once, and the walk's totals.
+# Also the walk keys that order entries the way a single-threaded walk
+# would meet them.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler); tests/ledger_test.lphc checks it in
+# native test binaries (Stage0), with threads.
+
+const HEX_DIGITS: string = "0123456789abcdef";
+
+# Eight lowercase hex digits: one level of a walk key.
+pub func key_part(index: int): string {
+    var digits: list[string] = ["0", "0", "0", "0", "0", "0", "0", "0"];
+    var n = index;
+    var k = 7;
+    while (k >= 0 and n > 0) {
+        digits[k] = HEX_DIGITS.slice(n % 16, n % 16 + 1);
+        n = n / 16;
+        k -= 1;
+    }
+    return digits.join("");
+}
+
+# The key of the entry at position `index` (in name order) of the
+# directory whose key is `parent`.
+#
+# A key is the operand's number, then the index of each entry on the way
+# down, eight hex digits per level. Comparing two keys as strings compares
+# the entries' places in a pre-order walk: a directory's key is a prefix of
+# (so sorts before) everything below it, and siblings sort by index.
+pub func child_key(parent: string, index: int): string {
+    return parent + key_part(index);
+}
+
+# A synchronized class serializes its modifier methods per instance: one
+# thread at a time runs claim(), note_error() or a query, so the dict and
+# the counters need no lock of their own, and the class is Sendable.
+pub synchronized class Ledger implements Sendable {
+    # dev:ino -> the smallest walk key that claimed it.
+    var winners: dict[string, string] = {};
+    var entries: int = 0;
+    var errors: int = 0;
+
+    # Records that the entry with walk key `key` is inode `inode`, which
+    # takes part in the seen-inode set. The smallest key wins, whichever
+    # thread gets here first: that is the entry a sequential walk would
+    # have met first, and the one du counts.
+    #
+    # Returns false when an earlier operand (key below `operand`, the
+    # current operand's key) already holds the inode: its walk is
+    # finished, so the entry is a repeat for certain and need not be
+    # walked at all.
+    pub modifier func claim(inode: string, key: string, operand: string): bool {
+        this.entries = this.entries + 1;
+        if (this.winners.containsKey(inode)) {
+            let held = this.winners[inode];
+            if (held < operand) {
+                return false;
+            }
+            if (key < held) {
+                this.winners[inode] = key;
+            }
+        } else {
+            this.winners[inode] = key;
+        }
+        return true;
+    }
+
+    # Whether the entry `key` holds `inode` once the walk is over.
+    pub modifier func won(inode: string, key: string): bool {
+        if (this.winners.containsKey(inode)) {
+            return this.winners[inode] == key;
+        }
+        return false;
+    }
+
+    # Counts an entry that is not in the seen-inode set.
+    pub modifier func note_entry(): void {
+        this.entries = this.entries + 1;
+    }
+
+    pub modifier func note_error(): void {
+        this.errors = this.errors + 1;
+    }
+
+    pub modifier func entry_count(): int {
+        return this.entries;
+    }
+
+    pub modifier func error_count(): int {
+        return this.errors;
+    }
+}

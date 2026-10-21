@@ -1,0 +1,18 @@
+@mode(host.native)
+
+# du: entry point. Keep this file thin: all behaviour lives in cli.app.run
+# so that tests can call it with an argument list.
+#
+# Runtime: host.native. main() gets the command line. `make build` compiles
+# this file and every module it imports ahead of time into the native binary
+# build/du (reference counting, OS threads, no interpreter) with the
+# self-hosted compiler, `loup build --target native`. There is no
+# interpreted lane: fs/files.lphc calls libc through `extern native`, which
+# `loup run` cannot do, so `make run` builds the binary and runs it.
+# `make check` type-checks the program from this file with Stage0.
+
+from cli.app import (run);
+
+func main(): int {
+    return run(runtime.args());
+}

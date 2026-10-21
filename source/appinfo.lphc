@@ -1,0 +1,23 @@
+@mode(host.native)
+
+# Application identity, exit statuses and the worker-thread limits of du.
+# Keep APP_NAME and APP_VERSION in step with `name` and `version` in
+# package.lppkg.
+#
+# Runtime: host.native. Constants only, compiled into the native binary
+# build/du by `make build` (the self-hosted compiler, `loup build --target
+# native`) and into each unit-test binary that imports them (Stage0,
+# `loup-bootstrap test --native`).
+
+pub const APP_NAME: string = "du";
+pub const APP_VERSION: string = "0.1.0";
+pub const APP_SUMMARY: string = "Summarize device usage of the set of FILEs, recursively for directories.";
+
+# GNU du exits 1 for any trouble: a usage error or a file it could not read.
+pub const EXIT_OK: int = 0;
+pub const EXIT_FAILURE: int = 1;
+
+# Worker threads: the default is the number of CPUs, capped, because a walk
+# is bound by the file system long before it is bound by the CPUs.
+pub const DEFAULT_MAX_THREADS: int = 8;
+pub const MAX_THREADS: int = 64;

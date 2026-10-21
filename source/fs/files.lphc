@@ -1,0 +1,242 @@
+@mode(host.native)
+
+# du's view of the file system: lstat/stat/fstatat through libc into a
+# FileInfo, errno and its message, and DirHandle, the owner of an open
+# directory descriptor.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler) and into the walker's unit-test
+# binaries (Stage0 native test runner). Every function here calls libc
+# through `extern native`, which only a native binary can do: `loup run`
+# stops at the first call.
+#
+# Structure: the C layout of `struct stat`, the libc declarations, errno,
+# FileInfo and the stat functions, then the unique class DirHandle.
+#
+# Layout assumed: Linux x86-64 with glibc, where `struct stat` is 144 bytes
+# (tests/files_test.lphc checks size_of[StatBuf]()). The field names carry
+# C's `st_` prefix, and no other type in the program may use them: the
+# native back ends place struct fields by name across the whole program, so
+# a shared name could move a field away from its C offset.
+
+from io.fs import (listDir);
+
+@repr(C)
+struct StatBuf {
+    pub var st_dev: uint64;
+    pub var st_ino: uint64;
+    pub var st_nlink: uint64;
+    pub var st_mode: uint32;
+    pub var st_uid: uint32;
+    pub var st_gid: uint32;
+    pub var st_pad0: int32;
+    pub var st_rdev: uint64;
+    pub var st_size: int64;
+    pub var st_blksize: int64;
+    pub var st_blocks: int64;
+    pub var st_atime_sec: int64;
+    pub var st_atime_nsec: int64;
+    pub var st_mtime_sec: int64;
+    pub var st_mtime_nsec: int64;
+    pub var st_ctime_sec: int64;
+    pub var st_ctime_nsec: int64;
+    pub var st_reserved0: int64;
+    pub var st_reserved1: int64;
+    pub var st_reserved2: int64;
+}
+
+# errno is a thread-local int that C reaches through __errno_location();
+# memcpy copies it out of that pointer into this one-field C struct.
+@repr(C)
+struct ErrnoCell {
+    pub var errno_value: int32;
+}
+
+# The libc calls are reentrant: each worker thread passes its own buffer and
+# descriptor, and errno is per thread.
+@unsafe("threadSafe: lstat, stat and fstatat only write the caller's buffer")
+extern native "c" func lstat(path: string, edits buf: StatBuf): int32;
+@unsafe("threadSafe: lstat, stat and fstatat only write the caller's buffer")
+extern native "c" func stat(path: string, edits buf: StatBuf): int32;
+@unsafe("threadSafe: lstat, stat and fstatat only write the caller's buffer")
+extern native "c" func fstatat(dirfd: int32, name: string, edits buf: StatBuf, flags: int32): int32;
+@unsafe("threadSafe: descriptors are per process; each walker opens and closes its own")
+extern native "c" func open(path: string, flags: int32, mode: int32): int32;
+@unsafe("threadSafe: descriptors are per process; each walker opens and closes its own")
+extern native "c" func close(fd: int32): int32;
+@unsafe("threadSafe: errno lives in thread-local storage")
+extern native "c" func __errno_location(): NativeHandle;
+extern native "c" func memcpy(edits dst: ErrnoCell, src: NativeHandle, n: uint64): NativeHandle;
+
+# open(2) and fstatat(2) flags (Linux x86-64 values, octal as in <fcntl.h>).
+const O_RDONLY: int = 0o0;
+const O_DIRECTORY: int = 0o200000;
+const O_CLOEXEC: int = 0o2000000;
+const AT_SYMLINK_NOFOLLOW: int = 0x100;
+
+# st_mode file types.
+const S_IFMT: int = 0o170000;
+const S_IFDIR: int = 0o040000;
+const S_IFREG: int = 0o100000;
+const S_IFLNK: int = 0o120000;
+
+# The errno values whose message du can print (Linux numbering, glibc
+# wording). These are the ones a walk meets in practice.
+const ENOENT: int = 2;
+const EACCES: int = 13;
+
+pub func size_of_stat_buf(): int {
+    return size_of[StatBuf]();
+}
+
+# The calling thread's errno, read right after a failed call.
+pub func last_errno(): int {
+    var cell = ErrnoCell(errno_value = 0i32);
+    memcpy(edits: cell, __errno_location(), 4u64);
+    return cell.errno_value as int;
+}
+
+# strerror() text for the errno values a walk meets.
+pub func errno_text(code: int): string {
+    if (code == 1) {
+        return "Operation not permitted";
+    } else if (code == ENOENT) {
+        return "No such file or directory";
+    } else if (code == 5) {
+        return "Input/output error";
+    } else if (code == 12) {
+        return "Cannot allocate memory";
+    } else if (code == EACCES) {
+        return "Permission denied";
+    } else if (code == 20) {
+        return "Not a directory";
+    } else if (code == 23 or code == 24) {
+        return "Too many open files";
+    } else if (code == 36) {
+        return "File name too long";
+    } else if (code == 40) {
+        return "Too many levels of symbolic links";
+    } else if (code == 75) {
+        return "Value too large for defined data type";
+    } else if (code == 116) {
+        return "Stale file handle";
+    }
+    return i"Unknown error {$ code $}";
+}
+
+# What du needs from one `struct stat`, copied out of the C buffer as soon
+# as the call returns, so the buffer never travels. Immutable, so it may be
+# handed to another thread.
+pub class FileInfo implements Sendable {
+    pub let dev: int;
+    pub let ino: int;
+    pub let nlink: int;
+    pub let mode: int;
+    # st_size: the apparent size in bytes.
+    pub let size: int;
+    # st_blocks: 512-byte blocks allocated on disk.
+    pub let blocks: int;
+
+    new(dev: int, ino: int, nlink: int, mode: int, size: int, blocks: int) {
+        this.dev = dev;
+        this.ino = ino;
+        this.nlink = nlink;
+        this.mode = mode;
+        this.size = size;
+        this.blocks = blocks;
+    }
+
+    pub func is_dir(): bool {
+        return (this.mode & S_IFMT) == S_IFDIR;
+    }
+
+    pub func is_regular(): bool {
+        return (this.mode & S_IFMT) == S_IFREG;
+    }
+
+    pub func is_link(): bool {
+        return (this.mode & S_IFMT) == S_IFLNK;
+    }
+
+    # The key of the seen-inode set: device and inode number.
+    pub func inode_key(): string {
+        return i"{$ this.dev $}:{$ this.ino $}";
+    }
+}
+
+func empty_buf(): StatBuf {
+    return StatBuf(
+        st_dev = 0u64, st_ino = 0u64, st_nlink = 0u64, st_mode = 0u32,
+        st_uid = 0u32, st_gid = 0u32, st_pad0 = 0i32, st_rdev = 0u64,
+        st_size = 0i64, st_blksize = 0i64, st_blocks = 0i64,
+        st_atime_sec = 0i64, st_atime_nsec = 0i64,
+        st_mtime_sec = 0i64, st_mtime_nsec = 0i64,
+        st_ctime_sec = 0i64, st_ctime_nsec = 0i64,
+        st_reserved0 = 0i64, st_reserved1 = 0i64, st_reserved2 = 0i64,
+    );
+}
+
+func info_of(buf: StatBuf): FileInfo {
+    return FileInfo(buf.st_dev as int, buf.st_ino as int, buf.st_nlink as int,
+        buf.st_mode as int, buf.st_size as int, buf.st_blocks as int);
+}
+
+# stat(2) (`follow`) or lstat(2) of a path: the FileInfo, or Err(errno).
+pub func stat_path(path: string, follow: bool): Result[FileInfo, int] {
+    var buf = empty_buf();
+    let status = if (follow) { stat(path, edits: buf) } else { lstat(path, edits: buf) };
+    if (status != 0i32) {
+        return Err(last_errno());
+    }
+    return Ok(info_of(buf));
+}
+
+# One open directory. A unique class has exactly one owner, so no second
+# reference can use the descriptor after it is closed, and finalize()
+# closes it exactly once: at `del`, or when the owner's scope ends.
+pub unique class DirHandle {
+    let fd: int32;
+    pub let path: string;
+    # errno of a failed open(), 0 when the directory is open.
+    pub let error: int;
+
+    new(path: string) {
+        this.path = path;
+        this.fd = open(path, (O_RDONLY | O_DIRECTORY | O_CLOEXEC) as int32, 0i32);
+        this.error = if (this.fd < 0i32) { last_errno() } else { 0 };
+    }
+
+    pub reads func is_open(): bool {
+        return this.fd >= 0i32;
+    }
+
+    # The entry names in byte order. The listing goes through the
+    # descriptor (/proc/self/fd/N names the directory it refers to), so it
+    # reads the same directory the entries are stat'ed in, even if the path
+    # was renamed in between.
+    pub reads func names(): list[string] {
+        var names: list[string] = [];
+        for (name in listDir(i"/proc/self/fd/{$ this.fd $}")) {
+            names.push(name);
+        }
+        names.sort(func(a: string, b: string): int { return a.compareTo(b); });
+        return names;
+    }
+
+    # fstatat(2) of an entry, relative to this directory: no path lookup
+    # from the root for each entry, as GNU du does it through fts.
+    pub reads func stat_entry(name: string, follow: bool): Result[FileInfo, int] {
+        var buf = empty_buf();
+        let flags = if (follow) { 0 } else { AT_SYMLINK_NOFOLLOW };
+        if (fstatat(this.fd, name, edits: buf, flags as int32) != 0i32) {
+            return Err(last_errno());
+        }
+        return Ok(info_of(buf));
+    }
+
+    func finalize(): void {
+        if (this.fd >= 0i32) {
+            close(this.fd);
+        }
+    }
+}

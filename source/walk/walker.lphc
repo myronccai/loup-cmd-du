@@ -1,0 +1,431 @@
+@mode(host.native)
+
+# du's parallel walk of one operand. The main thread stats the operand and
+# lists its top level; every top-level subdirectory becomes a job, and up to
+# N worker threads take jobs from a queue and walk them depth-first. Each
+# job's entries come back as a list of visits in pre-order, and the lists
+# are put together in name order once every worker has been joined.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler); OS threads (Thread.spawnWith) and
+# libc calls only run in a native binary. tests/walker_test.lphc walks
+# scratch trees in native test binaries (Stage0).
+#
+# Structure: Found (an entry listed and stat'ed), Walker (one thread's
+# walk: examine a directory, record entries, recurse), the synchronized
+# JobQueue and Harvest the threads share, then walk_operand(), which runs
+# the whole thing for one operand.
+#
+# Why the output does not depend on the threads: a worker never prints. It
+# records its job's entries in a list of its own, in the order a
+# single-threaded walk would meet them; the main thread splices the lists
+# into the operand's list by job number, which is name order. What a worker
+# shares with the others (the ledger) is designed so that its result does
+# not depend on who got there first (see walk/ledger.lphc).
+
+from cli.args import (Options, DEREF_NONE, DEREF_ALL);
+from fs.files import (FileInfo, DirHandle, stat_path, errno_text);
+from walk.excludes import (ExcludeList);
+from walk.ledger import (Ledger, key_part, child_key);
+from walk.visit import (Visit, error_visit, entry_path);
+
+# An entry found in a directory listing: its path and walk key, and either
+# what stat said about it or why it could not be stat'ed. Immutable, so a
+# directory found by the main thread can be handed to a worker as a job.
+class Found implements Sendable {
+    pub let path: string;
+    pub let name: string;
+    pub let depth: int;
+    pub let key: string;
+    pub let info: FileInfo?;
+    # dev:ino when the entry takes part in the seen-inode set, else "".
+    pub let inode: string;
+    pub let error: string;
+
+    new(path: string, name: string, depth: int, key: string, info: FileInfo?, inode: string, error: string) {
+        this.path = path;
+        this.name = name;
+        this.depth = depth;
+        this.key = key;
+        this.info = info;
+        this.inode = inode;
+        this.error = error;
+    }
+
+    pub func is_dir(): bool {
+        match this.info {
+            Some(i) => { return i.is_dir(); },
+            None => { return false; },
+        }
+    }
+}
+
+# One thread's walk. Not shared: each worker makes its own, and only the
+# finished `out` list leaves the thread (through Harvest).
+class Walker {
+    let opts: Options;
+    let excludes: ExcludeList;
+    let ledger: Ledger;
+    # Every entry takes part in the seen-inode set (several operands, or
+    # -L); otherwise only files with more than one link do.
+    let hash_all: bool;
+    # st_dev of the operand, for -x.
+    let root_dev: int;
+    # The walk key of the operand: claims below it come from this operand.
+    let operand_key: string;
+    # Whether there are exclude patterns at all (read once, not per entry).
+    let filtering: bool;
+    pub var out: list[Visit] = [];
+    # dev:ino of each directory from the operand down to the one being
+    # read: a directory found again on the way down is a cycle (-L).
+    var ancestors: list[string] = [];
+
+    new(opts: Options, excludes: ExcludeList, ledger: Ledger, hash_all: bool, root_dev: int, operand_key: string) {
+        this.opts = opts;
+        this.excludes = excludes;
+        this.ledger = ledger;
+        this.hash_all = hash_all;
+        this.root_dev = root_dev;
+        this.operand_key = operand_key;
+        this.filtering = excludes.len() > 0;
+    }
+
+    # The size an entry adds: its allocated blocks, or with
+    # --apparent-size its st_size, which GNU du only counts for regular
+    # files and symbolic links (a directory's st_size depends on the file
+    # system, so it adds nothing).
+    func bytes_of(info: FileInfo): int {
+        if (this.opts.apparent) {
+            return if (info.is_regular() or info.is_link()) { info.size } else { 0 };
+        }
+        return info.blocks * 512;
+    }
+
+    # Whether an entry goes into the seen-inode set: never with -l; every
+    # entry when hash_all; else files with more than one hard link.
+    pub func takes_part(info: FileInfo): bool {
+        if (this.opts.count_links) {
+            return false;
+        }
+        return this.hash_all or (!info.is_dir() and info.nlink > 1);
+    }
+
+    pub modifier func enter(ident: string): void {
+        this.ancestors.push(ident);
+    }
+
+    pub modifier func leave(): void {
+        this.ancestors.pop();
+    }
+
+    # Appends visits a worker recorded (the job's subtree).
+    pub modifier func append(visits: list[Visit]): void {
+        for (v in visits) {
+            this.out.push(v);
+        }
+    }
+
+    # Records a found entry that is not walked further: a file, a symbolic
+    # link, or an entry that could not be stat'ed.
+    pub modifier func record(found: Found): void {
+        if (found.error != "") {
+            safe { this.ledger.note_error(); }
+        }
+        match found.info {
+            Some(info) => {
+                this.out.push(Visit(found.name, found.depth, info.is_dir(), true,
+                    this.bytes_of(info), found.inode, found.key, found.error));
+            },
+            None => { this.out.push(error_visit(found.name, found.depth, found.error)); },
+        }
+    }
+
+    # Decides what to do with an entry that stat'ed fine: None when it is
+    # left out (another file system with -x, a cycle, or an inode an
+    # earlier operand already counted), else the Found to record or walk.
+    func admit(path: string, name: string, depth: int, key: string, info: FileInfo): Found? {
+        if (this.opts.one_file_system and info.dev != this.root_dev) {
+            return None;
+        }
+        if (info.is_dir() and this.ancestors.contains(info.inode_key())) {
+            return None;
+        }
+        var inode = "";
+        if (this.takes_part(info)) {
+            inode = info.inode_key();
+            var admitted = true;
+            safe { admitted = this.ledger.claim(inode, key, this.operand_key); }
+            if (!admitted) {
+                return None;
+            }
+        } else {
+            safe { this.ledger.note_entry(); }
+        }
+        return Some(Found(path, name, depth, key, Some(info), inode, ""));
+    }
+
+    # Lists the open directory `dir` (whose path is `path` and walk key
+    # `key`) and stats every entry relative to it. Excluded entries and
+    # those admit() leaves out are dropped; the rest come back in name
+    # order, at `depth`.
+    #
+    # Paths and keys are strings the native runtime keeps until the end of
+    # the run, so they are only built for an entry that needs them: a path
+    # to match a pattern, open a directory or report an error; a key for a
+    # directory or an entry in the seen-inode set.
+    pub func examine(borrow dir: DirHandle, path: string, depth: int, key: string): list[Found] {
+        let follow = this.opts.deref == DEREF_ALL;
+        let prefix = entry_path(path, "");
+        var found: list[Found] = [];
+        let names = dir.names();
+        var index = 0;
+        while (index < names.len()) {
+            let name = names[index];
+            let position = index;
+            index += 1;
+            var entry = "";
+            if (this.filtering) {
+                entry = prefix + name;
+                if (this.excludes.excludes(entry)) {
+                    continue;
+                }
+            }
+            match dir.stat_entry(name, follow) {
+                Ok(info) => {
+                    var entry_key = "";
+                    if (info.is_dir() or this.takes_part(info)) {
+                        entry_key = child_key(key, position);
+                    }
+                    if (entry == "" and info.is_dir()) {
+                        entry = prefix + name;
+                    }
+                    match this.admit(entry, name, depth, entry_key, info) {
+                        Some(f) => { found.push(f); },
+                        None => {},
+                    }
+                },
+                Err(code) => {
+                    if (entry == "") {
+                        entry = prefix + name;
+                    }
+                    found.push(Found(entry, name, depth, "", None, "", this.access_error(dir, name, entry, code, follow)));
+                },
+            }
+        }
+        return found;
+    }
+
+    # GNU du's message for an entry it cannot stat. Under -L a dangling
+    # symbolic link is reported without a reason, as GNU does.
+    func access_error(borrow dir: DirHandle, name: string, path: string, code: int, follow: bool): string {
+        if (follow) {
+            match dir.stat_entry(name, false) {
+                Ok(link) => {
+                    if (link.is_link()) {
+                        return i"cannot access '{$ path $}'";
+                    }
+                },
+                Err(_) => {},
+            }
+        }
+        return i"cannot access '{$ path $}': " + errno_text(code);
+    }
+
+    # Walks the directory `found`: opens it, records it (with an error if
+    # it cannot be read), examines its entries, closes it, and only then
+    # records or walks each entry, so one thread holds one descriptor at a
+    # time however deep the tree is.
+    pub modifier func walk_dir(found: Found): void {
+        unique let dir = DirHandle(found.path);
+        if (!dir.is_open()) {
+            let reason = errno_text(dir.error);
+            let failed = Found(found.path, found.name, found.depth, found.key, found.info,
+                found.inode, i"cannot read directory '{$ found.path $}': {$ reason $}");
+            this.record(failed);
+            return;
+        }
+        this.record(found);
+        var ident = "";
+        match found.info {
+            Some(i) => { ident = i.inode_key(); },
+            None => {},
+        }
+        this.enter(ident);
+        let entries = this.examine(borrow dir, found.path, found.depth + 1, found.key);
+        # Close the descriptor now; finalize() runs here, not at the end of
+        # the function, after the whole subtree.
+        del dir;
+        for (entry in entries) {
+            if (entry.is_dir()) {
+                this.walk_dir(entry);
+            } else {
+                this.record(entry);
+            }
+        }
+        this.leave();
+    }
+}
+
+# The jobs of one operand: its top-level directories, in name order. A
+# worker takes the next job number until none is left, so a worker that
+# finishes a small directory goes on with the next one.
+synchronized class JobQueue implements Sendable {
+    let jobs: list[Found];
+    var next: int = 0;
+
+    new(jobs: list[Found]) {
+        this.jobs = jobs;
+    }
+
+    # The next job's number, or -1 when all have been taken.
+    pub modifier func take(): int {
+        if (this.next >= this.jobs.len()) {
+            return -1;
+        }
+        let job = this.next;
+        this.next = job + 1;
+        return job;
+    }
+
+    pub modifier func job(n: int): Found {
+        return this.jobs[n];
+    }
+}
+
+# The finished visit list of each job, stored by its worker under the job
+# number and read by the main thread after every worker has been joined.
+synchronized class Harvest implements Sendable {
+    var lists: list[list[Visit]] = [];
+
+    new(jobs: int) {
+        var k = 0;
+        while (k < jobs) {
+            let empty: list[Visit] = [];
+            this.lists.push(empty);
+            k += 1;
+        }
+    }
+
+    pub modifier func store(job: int, visits: list[Visit]): void {
+        this.lists[job] = visits;
+    }
+
+    pub modifier func visits(job: int): list[Visit] {
+        return this.lists[job];
+    }
+}
+
+# One worker thread: takes jobs until the queue is empty and walks each
+# with a Walker of its own. Returns how many jobs it walked.
+func work(queue: JobQueue, harvest: Harvest, opts: Options, excludes: ExcludeList, ledger: Ledger,
+        hash_all: bool, root_dev: int, operand_key: string, root_ident: string): int {
+    var done = 0;
+    var job = -1;
+    safe { job = queue.take(); }
+    while (job >= 0) {
+        let walker = Walker(opts, excludes, ledger, hash_all, root_dev, operand_key);
+        safe {
+            walker.enter(root_ident);
+            walker.walk_dir(queue.job(job));
+            harvest.store(job, walker.out);
+            job = queue.take();
+        }
+        done += 1;
+    }
+    return done;
+}
+
+# Walks the jobs on `threads` worker threads and waits for all of them.
+# Each lambda captures only Sendable objects and immutable values; the
+# compiler checks that for Thread.spawnWith.
+func run_workers(queue: JobQueue, harvest: Harvest, threads: int, opts: Options, excludes: ExcludeList,
+        ledger: Ledger, hash_all: bool, root_dev: int, operand_key: string, root_ident: string): int {
+    var handles: list[ThreadHandle[int]] = [];
+    var k = 0;
+    while (k < threads) {
+        handles.push(Thread.spawnWith(func(): int {
+            return work(queue, harvest, opts, excludes, ledger, hash_all, root_dev, operand_key, root_ident);
+        }));
+        k += 1;
+    }
+    var walked = 0;
+    for (handle in handles) {
+        let n: int = handle.join();
+        walked += n;
+    }
+    return walked;
+}
+
+# Walks operand number `number` (`path` as given on the command line) with
+# up to `threads` workers and returns its visits in pre-order: the operand
+# at depth 0, then everything below it. Empty when the operand is excluded
+# or an earlier operand already counted it.
+pub func walk_operand(path: string, number: int, threads: int, opts: Options, excludes: ExcludeList,
+        ledger: Ledger, hash_all: bool): list[Visit] {
+    let none: list[Visit] = [];
+    if (excludes.excludes(path)) {
+        return none;
+    }
+    let operand_key = key_part(number);
+    var root = FileInfo(0, 0, 0, 0, 0, 0);
+    match stat_path(path, opts.deref != DEREF_NONE) {
+        Ok(info) => { root = info; },
+        Err(code) => {
+            safe { ledger.note_error(); }
+            let failed: list[Visit] = [error_visit(path, 0, i"cannot access '{$ path $}': " + errno_text(code))];
+            return failed;
+        },
+    }
+
+    let walker = Walker(opts, excludes, ledger, hash_all, root.dev, operand_key);
+    var top_found = Found(path, path, 0, operand_key, Some(root), "", "");
+    match walker.admit(path, path, 0, operand_key, root) {
+        Some(f) => { top_found = f; },
+        None => { return none; },
+    }
+    if (!root.is_dir()) {
+        safe { walker.record(top_found); }
+        return walker.out;
+    }
+
+    # The top level, on the main thread.
+    unique let dir = DirHandle(path);
+    if (!dir.is_open()) {
+        let failed = Found(path, path, 0, operand_key, Some(root), top_found.inode,
+            i"cannot read directory '{$ path $}': " + errno_text(dir.error));
+        safe { walker.record(failed); }
+        return walker.out;
+    }
+    safe {
+        walker.record(top_found);
+        walker.enter(root.inode_key());
+    }
+    let top = walker.examine(borrow dir, path, 1, operand_key);
+    del dir;
+
+    var jobs: list[Found] = [];
+    for (entry in top) {
+        if (entry.is_dir()) {
+            jobs.push(entry);
+        }
+    }
+    let queue = JobQueue(jobs);
+    let harvest = Harvest(jobs.len());
+    let workers = if (threads < jobs.len()) { threads } else { jobs.len() };
+    run_workers(queue, harvest, workers, opts, excludes, ledger, hash_all, root.dev, operand_key, root.inode_key());
+
+    # Splice: each top-level entry in name order, a directory followed by
+    # its job's visits.
+    var job = 0;
+    for (entry in top) {
+        if (entry.is_dir()) {
+            safe {
+                walker.append(harvest.visits(job));
+            }
+            job += 1;
+        } else {
+            safe { walker.record(entry); }
+        }
+    }
+    return walker.out;
+}

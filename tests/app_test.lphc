@@ -1,0 +1,56 @@
+@mode(host.native)
+
+# Unit tests for du's top level (cli/app.lphc, commands/du.lphc): exit
+# statuses, -X pattern files and the worker count.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here
+# into its own native binary and runs it in a fresh temporary directory.
+# The runs print to the test's output. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text, make_dir, make_file);
+from cli.app import (Environment, run_with_env);
+from cli.args import (parse_args);
+from commands.du import (read_pattern_file, thread_count);
+
+func plain(): Environment {
+    return Environment("", "", "", false);
+}
+
+func test_help_and_version(): void {
+    expectEq(run_with_env(["--version"], plain()), 0, "--version");
+    expectEq(run_with_env(["--help"], plain()), 0, "--help");
+}
+
+func test_usage_errors_exit_1(): void {
+    expectEq(run_with_env(["--bogus"], plain()), 1, "unknown option");
+    expectEq(run_with_env(["-s", "-a"], plain()), 1, "conflict");
+    expectEq(run_with_env(["-B", "0"], plain()), 1, "bad SIZE");
+}
+
+func test_walks_and_statuses(): void {
+    make_dir("tree/sub");
+    make_file("tree/sub/f", 10);
+    expectEq(run_with_env(["-s", "tree"], plain()), 0, "fine");
+    expectEq(run_with_env(["-s", "tree", "absent"], plain()), 1, "a missing operand");
+    expectEq(run_with_env(["-X", "absent", "tree"], plain()), 1, "a missing -X file");
+}
+
+func test_pattern_files(): void {
+    writeText("patterns", "*.o\n\ncache\n");
+    let patterns = read_pattern_file("patterns").unwrap();
+    expectEq(patterns.len(), 2, "empty lines skipped");
+    expect_text(patterns[1], "cache", "second pattern");
+    match read_pattern_file("absent") {
+        Ok(_) => { expect(false, "should fail"); },
+        Err(msg) => { expect_text(msg, "absent: No such file or directory", "message"); },
+    }
+}
+
+func test_thread_count(): void {
+    expectEq(thread_count(parse_args(["-j", "3"]).unwrap()), 3, "-j 3");
+    let none: list[string] = [];
+    let chosen = thread_count(parse_args(none).unwrap());
+    expect(chosen >= 1 and chosen <= 8, "one per CPU, at most 8");
+}

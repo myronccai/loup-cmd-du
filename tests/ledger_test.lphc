@@ -1,0 +1,101 @@
+@mode(host.native)
+
+# Unit tests for du's ledger (walk/ledger.lphc): walk keys, and claims that
+# give the same winner whichever thread claims first.
+#
+# Runtime: host.native, run by the test runner: `make test` runs
+# `loup-bootstrap test --native`, which compiles each `func test_*()` here
+# into its own native binary and runs it. Not part of build/du.
+
+from debug.assert import (expect, expectEq);
+from helpers import (expect_text);
+from walk.ledger import (Ledger, key_part, child_key);
+
+func test_key_parts(): void {
+    expect_text(key_part(0), "00000000", "zero");
+    expect_text(key_part(26), "0000001a", "hex");
+    expect_text(key_part(4294967295), "ffffffff", "largest");
+}
+
+func test_keys_sort_in_walk_order(): void {
+    let operand = key_part(0);
+    let a = child_key(operand, 0);
+    let a_x = child_key(a, 5);
+    let b = child_key(operand, 1);
+    let later_operand = key_part(1);
+    expect(operand < a, "a directory before its entries");
+    expect(a < a_x, "an entry before what is below it");
+    expect(a_x < b, "a whole subtree before the next sibling");
+    expect(child_key(operand, 9) < child_key(operand, 10), "siblings by index, not by digits");
+    expect(b < later_operand, "an operand before the next one");
+}
+
+func test_smallest_key_wins(): void {
+    let ledger = Ledger();
+    let operand = key_part(0);
+    let first = child_key(operand, 1);
+    let second = child_key(operand, 7);
+    safe {
+        expect(ledger.claim("1:42", second, operand), "claim");
+        expect(ledger.claim("1:42", first, operand), "an earlier place");
+        expect(ledger.won("1:42", first), "the earlier key wins");
+        expect(!ledger.won("1:42", second), "the later one loses");
+        expect(!ledger.won("1:43", first), "an unclaimed inode");
+    }
+}
+
+func test_earlier_operand_keeps_its_inodes(): void {
+    let ledger = Ledger();
+    let op0 = key_part(0);
+    let op1 = key_part(1);
+    safe {
+        expect(ledger.claim("1:9", child_key(op0, 3), op0), "first operand");
+        expect(!ledger.claim("1:9", child_key(op1, 0), op1), "second operand: already counted");
+        expect(ledger.won("1:9", child_key(op0, 3)), "still the first");
+    }
+}
+
+func test_totals(): void {
+    let ledger = Ledger();
+    safe {
+        ledger.note_entry();
+        ledger.note_entry();
+        ledger.note_error();
+        expectEq(ledger.entry_count(), 2, "entries");
+        expectEq(ledger.error_count(), 1, "errors");
+    }
+}
+
+# A worker claiming inodes 0..n-1 with keys in index order, from `first`
+# up (so different workers give the same inode different keys).
+func claim_all(ledger: Ledger, n: int, first: int): int {
+    let operand = key_part(0);
+    var k = 0;
+    while (k < n) {
+        safe { ledger.claim(i"1:{$ k $}", child_key(operand, first + k), operand); }
+        k += 1;
+    }
+    return n;
+}
+
+func test_threads_agree_on_the_winner(): void {
+    let ledger = Ledger();
+    let late = Thread.spawnWith(func(): int { return claim_all(ledger, 200, 5000); });
+    let early = Thread.spawnWith(func(): int { return claim_all(ledger, 200, 100); });
+    let middle = Thread.spawnWith(func(): int { return claim_all(ledger, 200, 2000); });
+    let claimed: int = late.join() + early.join() + middle.join();
+    expectEq(claimed, 600, "all claims made");
+    let operand = key_part(0);
+    var winners = 0;
+    var k = 0;
+    while (k < 200) {
+        var won = false;
+        safe { won = ledger.won(i"1:{$ k $}", child_key(operand, 100 + k)); }
+        if (won) {
+            winners += 1;
+        }
+        k += 1;
+    }
+    expectEq(winners, 200, "the smallest key won every time");
+    safe { expectEq(ledger.entry_count(), 600, "entries counted under the lock"); }
+}

@@ -1,0 +1,119 @@
+@mode(host.native)
+
+# du's report: the lines for an operand's tree, in post-order, with each
+# directory's size summed from what is counted below it, and the grand
+# total. Pure: it returns the lines (standard output and standard error, in
+# the order they belong), and only commands/du.lphc prints them.
+#
+# Runtime: host.native. Compiled into the native binary build/du by
+# `make build` (self-hosted compiler); tests/report_test.lphc checks it in
+# native test binaries (Stage0) with hand-made visits and a ledger.
+
+from cli.args import (Options);
+from report.tree import (Entry);
+from size.units import (format_size);
+from walk.ledger import (Ledger);
+
+# One line of output, for standard output or standard error.
+pub class OutLine {
+    pub let to_stderr: bool;
+    pub let text: string;
+
+    new(to_stderr: bool, text: string) {
+        this.to_stderr = to_stderr;
+        this.text = text;
+    }
+}
+
+pub class Report {
+    let opts: Options;
+    let ledger: Ledger;
+    # Standard-output lines end with this: "\n", or a NUL byte with -0.
+    let ending: string;
+    pub var lines: list[OutLine] = [];
+    # Everything counted in every operand, for -c.
+    pub var grand_total: int = 0;
+
+    new(opts: Options, ledger: Ledger) {
+        this.opts = opts;
+        this.ledger = ledger;
+        this.ending = if (opts.zero_terminated) { str(char.of(0)) } else { "\n" };
+    }
+
+    # Whether the entry at `level` gets a line: the operand always; below
+    # it only within --max-depth (0 with -s), and files only with -a.
+    func shown(is_dir: bool, level: int): bool {
+        if (level == 0) {
+            return true;
+        }
+        if (this.opts.max_depth >= 0 and level > this.opts.max_depth) {
+            return false;
+        }
+        return is_dir or this.opts.all;
+    }
+
+    # -t: at least the threshold, or at most its magnitude when negative.
+    func passes_threshold(bytes: int): bool {
+        if (!this.opts.threshold_given) {
+            return true;
+        }
+        if (this.opts.threshold < 0) {
+            return bytes <= 0 - this.opts.threshold;
+        }
+        return bytes >= this.opts.threshold;
+    }
+
+    pub modifier func add_line(size: int, path: string): void {
+        let text = format_size(size, this.opts.block) + "\t" + path + this.ending;
+        this.lines.push(OutLine(false, text));
+    }
+
+    pub modifier func add_error(message: string): void {
+        this.lines.push(OutLine(true, "du: " + message));
+    }
+
+    # Emits the subtree of `entry` (at `level` below its operand) in
+    # post-order and returns the size it adds to its parent. An entry whose
+    # inode was claimed by an earlier place in the walk adds nothing and
+    # is not shown, nor is anything below it.
+    pub modifier func emit[lifetime ~t](entry: Entry[~t], level: int): int {
+        let v = entry.visit;
+        if (v.inode != "") {
+            var counted = false;
+            safe { counted = this.ledger.won(v.inode, v.key); }
+            if (!counted) {
+                return 0;
+            }
+        }
+        if (v.error != "") {
+            this.add_error(v.error);
+        }
+        if (!v.present) {
+            return 0;
+        }
+        var size = v.bytes;
+        this.grand_total = this.grand_total + v.bytes;
+        for (child in entry.children) {
+            let below = this.emit(child, level + 1);
+            # -S: a directory's size leaves out its subdirectories.
+            if (!this.opts.separate_dirs or !child.visit.is_dir) {
+                size += below;
+            }
+        }
+        if (this.shown(v.is_dir, level) and this.passes_threshold(size)) {
+            this.add_line(size, entry.path());
+        }
+        return size;
+    }
+
+    # Forgets the lines already printed.
+    pub modifier func clear(): void {
+        let none: list[OutLine] = [];
+        this.lines = none;
+    }
+
+    # The -c line.
+    pub modifier func add_total(): void {
+        this.add_line(this.grand_total, "total");
+    }
+}
